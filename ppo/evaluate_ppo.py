@@ -45,11 +45,15 @@ def evaluate_agent(agent, instances, config: PPOConfig, save_gantt_prefix: str |
 
     for instance in instances:
         wrapper = VectorSchedulingWrapper(instance, config)
-        obs, mask = wrapper.reset(instance)
+        obs, _ = wrapper.reset(instance)
         done = False
         while not done:
-            action, _, _ = agent.select_action(obs, mask, greedy=True)
-            obs, _, done, _, mask = wrapper.step(action)
+            masks = wrapper.get_policy_masks()
+            action, _, _ = agent.select_action(obs, masks, greedy=True)
+            if config.action_mode == "two_head":
+                obs, _, done, _, _ = wrapper.step_two_head(int(action[0]), int(action[1]))
+            else:
+                obs, _, done, _, _ = wrapper.step(int(action))
         metrics = compute_metrics(wrapper.env)
         metrics_rows.append(metrics)
         last_env = wrapper.env
@@ -101,10 +105,14 @@ def evaluate_heuristics_fixed(size: str, output_path: str = "data/results/ppo/he
     path = Path(output_path)
     if path.exists():
         with path.open("r", newline="") as f:
-            existing = [row for row in csv.DictReader(f) if row["size"] != size]
+            existing = [
+                row
+                for row in csv.DictReader(f)
+                if row.get("size") != size and "method" in row
+            ]
     all_rows = existing + rows
     with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()), extrasaction="ignore")
         writer.writeheader()
         writer.writerows(all_rows)
     return rows

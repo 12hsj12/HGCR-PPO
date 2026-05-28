@@ -1,4 +1,4 @@
-"""Vector observation encoder and flattened action wrapper."""
+"""Vector observation encoder and PPO action/reward wrapper."""
 
 from __future__ import annotations
 
@@ -8,17 +8,20 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from configs.ppo_config import PPOConfig
+from src.baselines.heuristics import run_heuristic
 from src.envs.rolling_scheduling_env import RollingSchedulingEnv
 
 
 PROCESS_TYPES = ["sl", "cu", "co"]
+_REFERENCE_CMAX_CACHE: Dict[tuple[str, str], float] = {}
 
 
 class VectorSchedulingWrapper:
     """Padded vector-state interface for PPO.
 
-    The underlying scheduling environment remains responsible for feasibility,
-    ECT machine selection, split ratios, and time updates.
+    The original environment remains untouched. This wrapper handles fixed-size
+    observations, action masks, two-head action adaptation, and PPO-specific
+    reward shaping.
     """
 
     def __init__(self, instance, config: PPOConfig):
@@ -39,6 +42,7 @@ class VectorSchedulingWrapper:
         self.illegal_action_count = 0
         self.legal_action_count = 0
         self.selected_split_nums: List[int] = []
+        self.reference_cmax = 1.0
         self.reset(instance)
 
     def reset(self, instance=None) -> Tuple[np.ndarray, np.ndarray]:
@@ -49,36 +53,35 @@ class VectorSchedulingWrapper:
         self.illegal_action_count = 0
         self.legal_action_count = 0
         self.selected_split_nums = []
+        self.reference_cmax = self._estimate_reference_cmax()
         return self.get_observation(), self.get_action_mask()
 
     def step(self, action_id: int):
+        """Flattened-action compatibility path."""
+
         mask = self.get_action_mask()
         if action_id < 0 or action_id >= self.action_dim or not mask[action_id]:
-            self.illegal_action_count += 1
-            done = self.env.is_done()
-            return self.get_observation(), self.config.illegal_action_penalty, done, {
-                "illegal_action": True,
-                "illegal_action_count": self.illegal_action_count,
-                "action_mask_ratio": float(mask.mean()),
-            }, mask
+            return self._illegal_step(mask)
 
         job_id, split_num = self.decode_action(action_id)
-        self.legal_action_count += 1
-        self.selected_split_nums.append(split_num)
-        obs, reward, done, info = self.env.step((job_id, split_num))
-        if done:
-            reward += -self.config.alpha_final_reward * info["final_makespan"]
-        next_mask = self.get_action_mask()
-        info.update(
-            {
-                "illegal_action": False,
-                "illegal_action_count": self.illegal_action_count,
-                "legal_action_count": self.legal_action_count,
-                "action_mask_ratio": float(next_mask.mean()),
-                "selected_split_num": split_num,
-            }
-        )
-        return self.get_observation(), reward, done, info, next_mask
+        return self._step_job_split(job_id, split_num)
+
+    def step_two_head(self, job_slot: int, split_index: int):
+        job_mask = self.get_job_mask()
+        split_masks = self.get_split_masks()
+        if (
+            job_slot < 0
+            or job_slot >= self.max_jobs
+            or split_index < 0
+            or split_index >= self.max_split
+            or not job_mask[job_slot]
+            or not split_masks[job_slot, split_index]
+        ):
+            return self._illegal_step(self.get_action_mask())
+
+        job_id = self.jobs[job_slot].job_id
+        split_num = split_index + 1
+        return self._step_job_split(job_id, split_num)
 
     def decode_action(self, action_id: int) -> Tuple[str, int]:
         job_slot = action_id // self.max_split
@@ -89,15 +92,31 @@ class VectorSchedulingWrapper:
         return self.job_id_to_slot[job_id] * self.max_split + (split_num - 1)
 
     def get_action_mask(self) -> np.ndarray:
-        mask = np.zeros(self.action_dim, dtype=np.bool_)
+        return self.get_split_masks().reshape(-1)
+
+    def get_job_mask(self) -> np.ndarray:
+        mask = np.zeros(self.max_jobs, dtype=np.bool_)
+        schedulable = set(self.env.get_schedulable_jobs())
+        for slot, job in enumerate(self.jobs[: self.max_jobs]):
+            mask[slot] = job.job_id in schedulable
+        return mask
+
+    def get_split_masks(self) -> np.ndarray:
+        masks = np.zeros((self.max_jobs, self.max_split), dtype=np.bool_)
         schedulable = set(self.env.get_schedulable_jobs())
         for slot, job in enumerate(self.jobs[: self.max_jobs]):
             if job.job_id not in schedulable:
                 continue
             max_legal_split = min(job.max_split_num, len(job.candidate_machines), self.max_split)
-            for split_num in range(1, max_legal_split + 1):
-                mask[slot * self.max_split + (split_num - 1)] = True
-        return mask
+            masks[slot, :max_legal_split] = True
+        return masks
+
+    def get_policy_masks(self) -> Dict[str, np.ndarray]:
+        return {
+            "flat": self.get_action_mask(),
+            "job": self.get_job_mask(),
+            "split": self.get_split_masks(),
+        }
 
     def get_observation(self) -> np.ndarray:
         scale = self._time_scale()
@@ -159,12 +178,107 @@ class VectorSchedulingWrapper:
         )
         return np.concatenate([job_features.ravel(), machine_features.ravel(), global_features])
 
-    def _process_one_hot(self, process_type: str) -> List[float]:
-        return [1.0 if process_type == value else 0.0 for value in PROCESS_TYPES]
-
-    def _time_scale(self) -> float:
-        return max(1.0, self.env.instance.rolling_period_length * self.env.instance.num_periods)
+    def observation_stats(self) -> Dict[str, float]:
+        obs = self.get_observation()
+        return {
+            "obs_mean": float(obs.mean()),
+            "obs_std": float(obs.std()),
+            "obs_min": float(obs.min()),
+            "obs_max": float(obs.max()),
+        }
 
     def split_distribution(self) -> Dict[int, int]:
         counts = Counter(self.selected_split_nums)
         return {split_num: counts.get(split_num, 0) for split_num in range(1, self.max_split + 1)}
+
+    def _step_job_split(self, job_id: str, split_num: int):
+        self.legal_action_count += 1
+        self.selected_split_nums.append(split_num)
+        _, raw_reward, done, info = self.env.step((job_id, split_num))
+        scaled_reward = self._shape_reward(raw_reward, done, info)
+        next_mask = self.get_action_mask()
+        relative_improvement = (
+            (self.reference_cmax - self.env.current_cmax) / self.reference_cmax
+            if done
+            else 0.0
+        )
+        info.update(
+            {
+                "illegal_action": False,
+                "illegal_action_count": self.illegal_action_count,
+                "legal_action_count": self.legal_action_count,
+                "action_mask_ratio": float(next_mask.mean()),
+                "selected_split_num": split_num,
+                "raw_reward": raw_reward,
+                "scaled_reward": scaled_reward,
+                "reference_Cmax": self.reference_cmax,
+                "relative_improvement_vs_reference": relative_improvement,
+                "selected_job": job_id,
+            }
+        )
+        return self.get_observation(), scaled_reward, done, info, next_mask
+
+    def _illegal_step(self, mask: np.ndarray):
+        self.illegal_action_count += 1
+        done = self.env.is_done()
+        penalty = self.config.illegal_action_penalty * self.config.reward_scale
+        return self.get_observation(), penalty, done, {
+            "illegal_action": True,
+            "illegal_action_count": self.illegal_action_count,
+            "legal_action_count": self.legal_action_count,
+            "action_mask_ratio": float(mask.mean()) if mask.size else 0.0,
+            "raw_reward": 0.0,
+            "scaled_reward": penalty,
+            "reference_Cmax": self.reference_cmax,
+            "relative_improvement_vs_reference": 0.0,
+            "selected_job": "",
+            "selected_split_num": 0,
+        }, mask
+
+    def _shape_reward(self, raw_reward: float, done: bool, info: Dict) -> float:
+        if self.config.reward_mode != "normalized_delta_plus_baseline_final":
+            reward = raw_reward * self.config.reward_scale
+            if done:
+                reward += -self.config.alpha_final_reward * info["final_makespan"]
+            return reward
+
+        reward = raw_reward / self.reference_cmax if self.config.use_reward_normalization else raw_reward
+        if self.config.reward_clip is not None:
+            reward = float(np.clip(reward, -self.config.reward_clip, self.config.reward_clip))
+        if done:
+            final_cmax = info["final_makespan"]
+            if self.config.use_reward_normalization:
+                reward += self.config.final_reward_beta * (self.reference_cmax - final_cmax) / self.reference_cmax
+            else:
+                reward += -self.config.alpha_final_reward * final_cmax
+        return reward * self.config.reward_scale
+
+    def _estimate_reference_cmax(self) -> float:
+        key = (self.env.instance.name, self.config.reference_baseline)
+        if key in _REFERENCE_CMAX_CACHE:
+            return _REFERENCE_CMAX_CACHE[key]
+
+        reference = 0.0
+        if self.config.reference_baseline:
+            try:
+                reference = run_heuristic(self.env.instance, self.config.reference_baseline).metrics["Cmax_roll"]
+            except Exception:
+                reference = 0.0
+        if reference <= 1e-6:
+            reference = self._fallback_reference_cmax()
+        reference = max(reference, 1e-6)
+        _REFERENCE_CMAX_CACHE[key] = reference
+        return reference
+
+    def _fallback_reference_cmax(self) -> float:
+        total_min_time = 0.0
+        for job in self.env.instance.jobs:
+            total_min_time += min(self.env.instance.processing_time[job.job_id].values())
+        return max(total_min_time / max(1, len(self.env.instance.machines)), self._time_scale())
+
+    def _process_one_hot(self, process_type: str) -> List[float]:
+        return [1.0 if process_type == value else 0.0 for value in PROCESS_TYPES]
+
+    def _time_scale(self) -> float:
+        horizon = self.env.instance.rolling_period_length * self.env.instance.num_periods
+        return max(1.0, horizon, self.reference_cmax)

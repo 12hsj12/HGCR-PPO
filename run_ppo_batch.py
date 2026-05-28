@@ -24,7 +24,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, choices=[100, 500, 1000], required=True)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--eval_interval", type=int, default=20)
+    parser.add_argument("--eval_interval", type=int, default=10)
     args = parser.parse_args()
     train_ppo = _load_train_ppo()
     for size in ["small", "medium", "large"]:

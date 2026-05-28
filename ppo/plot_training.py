@@ -33,15 +33,47 @@ def _save_line(path: Path, x, series, title: str, ylabel: str) -> None:
     plt.close(fig)
 
 
+def _save_eval_line(path: Path, x, train_values, eval_values, title: str, ylabel: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 4.6))
+    ax.plot(x, train_values, label="train_final_Cmax")
+    eval_x = []
+    eval_y = []
+    for episode, value in zip(x, eval_values):
+        if value == value:
+            eval_x.append(episode)
+            eval_y.append(value)
+    if eval_x:
+        ax.plot(eval_x, eval_y, marker="o", label="eval_Cmax_mean")
+    ax.set_xlabel("episode")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def create_training_plots(log_path: str, size: str, episodes: int) -> None:
     rows = _read_csv(log_path)
     x = [int(row["episode"]) for row in rows]
     base = Path("data/results/ppo/plots")
-    _save_line(base / f"reward_curve_{size}_{episodes}.png", x, {"train_episode_reward": _float(rows, "train_episode_reward")}, "PPO reward", "reward")
     _save_line(
+        base / f"reward_curve_{size}_{episodes}.png",
+        x,
+        {
+            "raw_episode_reward": _float(rows, "raw_episode_reward"),
+            "scaled_episode_reward": _float(rows, "scaled_episode_reward"),
+        },
+        "PPO reward",
+        "reward",
+    )
+    _save_eval_line(
         base / f"cmax_curve_{size}_{episodes}.png",
         x,
-        {"train_final_Cmax": _float(rows, "train_final_Cmax"), "eval_Cmax_mean": _float(rows, "eval_Cmax_mean")},
+        _float(rows, "train_final_Cmax"),
+        _float(rows, "eval_Cmax_mean"),
         "PPO Cmax",
         "Cmax",
     )
@@ -52,13 +84,46 @@ def create_training_plots(log_path: str, size: str, episodes: int) -> None:
         "PPO losses",
         "loss",
     )
-    _save_line(base / f"entropy_curve_{size}_{episodes}.png", x, {"entropy": _float(rows, "entropy")}, "PPO entropy", "entropy")
+    _save_line(
+        base / f"entropy_curve_{size}_{episodes}.png",
+        x,
+        {
+            "total_entropy": _float(rows, "entropy"),
+            "job_entropy": _float(rows, "job_entropy"),
+            "split_entropy": _float(rows, "split_entropy"),
+        },
+        "PPO entropy",
+        "entropy",
+    )
     _save_line(
         base / f"split_num_curve_{size}_{episodes}.png",
         x,
         {"average_selected_split_num": _float(rows, "average_selected_split_num")},
         "Selected split number",
         "average split_num",
+    )
+    _save_line(
+        base / f"split_num_ratio_curve_{size}_{episodes}.png",
+        x,
+        {
+            "split_num_1_ratio": _float(rows, "split_num_1_ratio"),
+            "split_num_2_ratio": _float(rows, "split_num_2_ratio"),
+            "split_num_3_ratio": _float(rows, "split_num_3_ratio"),
+            "split_num_4_ratio": _float(rows, "split_num_4_ratio"),
+        },
+        "Selected split number ratios",
+        "ratio",
+    )
+    _save_line(
+        base / f"value_diagnostics_{size}_{episodes}.png",
+        x,
+        {
+            "value_pred_mean": _float(rows, "value_pred_mean"),
+            "value_target_mean": _float(rows, "value_target_mean"),
+            "explained_variance": _float(rows, "explained_variance"),
+        },
+        "Value diagnostics",
+        "value",
     )
 
 
