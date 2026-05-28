@@ -65,7 +65,8 @@ def generate_instance(size: str = "small", seed: int = 42) -> SchedulingInstance
         min_candidates = min(2, len(candidate_pool))
         candidate_count = rng.randint(min_candidates, len(candidate_pool))
         candidate_machines = sorted(rng.sample(candidate_pool, candidate_count))
-        max_split_num = rng.randint(1, min(3, len(candidate_machines)))
+        split_cap = 4 if size in {"medium", "large"} else 3
+        max_split_num = rng.randint(1, min(split_cap, len(candidate_machines)))
         period_idx = rng.randrange(num_periods)
         release_floor = period_idx * rolling_period_length
         release_ceiling = min(release_floor + rolling_period_length * 0.8, horizon_release_end)
@@ -99,4 +100,3 @@ def generate_instance(size: str = "small", seed: int = 42) -> SchedulingInstance
         num_periods=num_periods,
         name=f"{size}_seed_{seed}",
     )
-

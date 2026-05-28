@@ -62,6 +62,8 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+`torch` is required only for PPO training/evaluation. Baseline generation and dataset summaries can run without importing the PPO trainer.
+
 ## Run Baselines
 
 ```bash
@@ -79,6 +81,41 @@ data/results/
 ```
 
 These files are runtime outputs and are ignored by Git by default.
+
+## Fixed Datasets
+
+Generate the fixed train/test instance sets used by PPO and heuristic comparisons:
+
+```bash
+python dataset_manager.py --generate_all
+python dataset_manager.py --summary
+```
+
+Instances are stored under `data/instances/`. Existing fixed instances are reused by default; pass `--regenerate_instances` with `--generate_all` only when you intentionally want to overwrite them.
+
+## Plain PPO
+
+This stage uses a vector-state PPO baseline without GNNs. The environment still owns feasibility, ECT machine selection, split-ratio calculation, and reward computation.
+
+Run one size:
+
+```bash
+python run_ppo.py --size small --episodes 100
+```
+
+Run all sizes for a fixed episode budget:
+
+```bash
+python run_ppo_batch.py --episodes 100
+```
+
+PPO outputs are written to:
+
+```text
+data/models/
+data/logs/
+data/results/ppo/
+```
 
 ## Tests
 
