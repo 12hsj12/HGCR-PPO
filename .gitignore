@@ -13,6 +13,8 @@ data/results/
 *.csv
 *.xlsx
 *.pkl
+!data/instances/
+!data/instances/*.pkl
 *.pt
 *.pth
 .DS_Store
