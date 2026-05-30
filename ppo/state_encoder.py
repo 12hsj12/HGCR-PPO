@@ -83,6 +83,15 @@ class VectorSchedulingWrapper:
         split_num = split_index + 1
         return self._step_job_split(job_id, split_num)
 
+    def step_order_only(self, job_slot: int):
+        job_mask = self.get_job_mask()
+        if job_slot < 0 or job_slot >= self.max_jobs or not job_mask[job_slot]:
+            return self._illegal_step(self.get_action_mask())
+
+        job_id = self.jobs[job_slot].job_id
+        split_num = self.choose_split_num(job_id)
+        return self._step_job_split(job_id, split_num)
+
     def decode_action(self, action_id: int) -> Tuple[str, int]:
         job_slot = action_id // self.max_split
         split_num = action_id % self.max_split + 1
@@ -189,7 +198,31 @@ class VectorSchedulingWrapper:
 
     def split_distribution(self) -> Dict[int, int]:
         counts = Counter(self.selected_split_nums)
-        return {split_num: counts.get(split_num, 0) for split_num in range(1, self.max_split + 1)}
+        return {split_num: counts.get(split_num, 0) for split_num in range(1, 5)}
+
+    def choose_split_num(self, job_id: str) -> int:
+        job = self.env.job_by_id[job_id]
+        max_legal = min(job.max_split_num, len(job.candidate_machines), self.max_split)
+        if self.config.split_rule == "min1":
+            return 1
+        if self.config.split_rule == "max_feasible":
+            return max(1, max_legal)
+        return self._greedy_ect_split(job_id, max_legal)
+
+    def _greedy_ect_split(self, job_id: str, max_legal: int) -> int:
+        best_split = 1
+        best_completion = float("inf")
+        for split_num in range(1, max(1, max_legal) + 1):
+            trial = self.env.clone()
+            try:
+                _, _, _, info = trial.step((job_id, split_num))
+            except ValueError:
+                continue
+            completion = float(info["job_completion_time"])
+            if completion < best_completion:
+                best_completion = completion
+                best_split = split_num
+        return best_split
 
     def _step_job_split(self, job_id: str, split_num: int):
         self.legal_action_count += 1

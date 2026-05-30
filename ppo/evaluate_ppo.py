@@ -50,7 +50,9 @@ def evaluate_agent(agent, instances, config: PPOConfig, save_gantt_prefix: str |
         while not done:
             masks = wrapper.get_policy_masks()
             action, _, _ = agent.select_action(obs, masks, greedy=True)
-            if config.action_mode == "two_head":
+            if config.policy_mode == "order_only":
+                obs, _, done, _, _ = wrapper.step_order_only(int(action[0]))
+            elif config.action_mode == "two_head":
                 obs, _, done, _, _ = wrapper.step_two_head(int(action[0]), int(action[1]))
             else:
                 obs, _, done, _, _ = wrapper.step(int(action))

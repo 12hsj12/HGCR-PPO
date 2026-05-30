@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import pickle
 import random
 from pathlib import Path
 from statistics import mean
@@ -26,6 +27,7 @@ from ppo.ppo_agent import PPOAgent
 from ppo.rollout_buffer import RolloutBuffer
 from ppo.state_encoder import VectorSchedulingWrapper
 from src.evaluation.metrics import compute_metrics
+from src.baselines.heuristics import POLICIES
 
 
 LOG_FIELDS = [
@@ -102,6 +104,12 @@ LOG_FIELDS = [
     "selected_split_2_count",
     "selected_split_3_count",
     "selected_split_4_count",
+    "policy_mode",
+    "split_rule",
+    "bc_loss",
+    "bc_accuracy",
+    "bc_epochs",
+    "expert_heuristic",
 ]
 
 
@@ -112,6 +120,7 @@ def _ensure_dirs() -> None:
         "data/results/ppo",
         "data/results/ppo/plots",
         "data/results/ppo/gantt",
+        "data/expert_trajs",
     ]:
         Path(path).mkdir(parents=True, exist_ok=True)
 
@@ -179,6 +188,14 @@ def _run_label(config: PPOConfig) -> str:
     return label
 
 
+def _artifact_stem(config: PPOConfig) -> str:
+    label = _run_label(config)
+    if config.policy_mode == "order_only":
+        bc = "_bc" if config.bc_pretrain else ""
+        return f"ppo_order_only{bc}_{config.size}_{label}"
+    return f"ppo_{config.size}_{label}"
+
+
 def _legal_split_counts(wrapper: VectorSchedulingWrapper) -> Dict[int, int]:
     masks = wrapper.get_split_masks()
     counts = {}
@@ -201,6 +218,72 @@ def _select_train_eval_instances(config: PPOConfig):
     return load_dataset(config.size, "train"), load_dataset(config.size, "test")
 
 
+def _expert_path(instance, config: PPOConfig) -> Path:
+    method = config.expert_heuristic.lower()
+    split = config.overfit_split if config.overfit_one_instance else "train"
+    size, _, seed = instance.name.partition("_seed_")
+    name = f"{size}_{split}_seed_{seed}" if seed else instance.name
+    return Path("data/expert_trajs") / f"{method}_{name}.pkl"
+
+
+def _generate_expert_trajectory(instance, config: PPOConfig) -> List[Dict]:
+    path = _expert_path(instance, config)
+    if path.exists() and not config.regenerate_expert:
+        with path.open("rb") as f:
+            return pickle.load(f)
+
+    heuristic_name = next((name for name in POLICIES if name.lower() == config.expert_heuristic.lower()), config.expert_heuristic)
+    policy = POLICIES[heuristic_name]
+    rng = random.Random(config.seed)
+    wrapper = VectorSchedulingWrapper(instance, config)
+    obs, _ = wrapper.reset(instance)
+    samples = []
+    step_index = 0
+    while not wrapper.env.is_done():
+        job_id = policy(wrapper.env, rng)
+        job_slot = wrapper.job_id_to_slot[job_id]
+        masks = wrapper.get_policy_masks()
+        samples.append(
+            {
+                "observation": obs.copy(),
+                "job_mask": masks["job"].copy(),
+                "expert_job_id": job_id,
+                "expert_job_slot": job_slot,
+                "step_index": step_index,
+                "final_Cmax": None,
+            }
+        )
+        if config.policy_mode == "order_only":
+            obs, _, _, _, _ = wrapper.step_order_only(job_slot)
+        else:
+            split_num = wrapper.choose_split_num(job_id)
+            obs, _, _, _, _ = wrapper.step_two_head(job_slot, split_num - 1)
+        step_index += 1
+
+    final_cmax = compute_metrics(wrapper.env)["Cmax_roll"]
+    for sample in samples:
+        sample["final_Cmax"] = final_cmax
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as f:
+        pickle.dump(samples, f)
+    return samples
+
+
+def _load_or_create_expert_samples(instances, config: PPOConfig) -> List[Dict]:
+    samples = []
+    for instance in instances:
+        samples.extend(_generate_expert_trajectory(instance, config))
+    return samples
+
+
+def _step_with_policy_mode(wrapper: VectorSchedulingWrapper, config: PPOConfig, action):
+    if config.policy_mode == "order_only":
+        return wrapper.step_order_only(int(action[0]))
+    if config.action_mode == "two_head":
+        return wrapper.step_two_head(int(action[0]), int(action[1]))
+    return wrapper.step(int(action))
+
+
 def train_ppo(config: PPOConfig) -> Dict[str, float]:
     _ensure_dirs()
     _set_seed(config.seed)
@@ -213,14 +296,19 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
     rows = []
     best_eval = float("inf")
     run_label = _run_label(config)
-    best_agent_path = Path("data/models") / f"ppo_{config.size}_{run_label}_best.pt"
-    last_agent_path = Path("data/models") / f"ppo_{config.size}_{run_label}_last.pt"
+    artifact_stem = _artifact_stem(config)
+    best_agent_path = Path("data/models") / f"{artifact_stem}_best.pt"
+    last_agent_path = Path("data/models") / f"{artifact_stem}_last.pt"
     final_eval = None
     all_split_counts = {i: 0 for i in range(1, 5)}
-    overfit_reference_rows = _run_reference_heuristics(train_instances[0]) if config.overfit_one_instance else []
-    fifo_cmax = _reference_value(overfit_reference_rows, "FIFO") if config.overfit_one_instance else float("nan")
-    greedy_cmax = _reference_value(overfit_reference_rows, "GreedyECT") if config.overfit_one_instance else float("nan")
-    random_cmax = _reference_value(overfit_reference_rows, "Random") if config.overfit_one_instance else float("nan")
+    reference_rows = _run_reference_heuristics(train_instances[0]) if (config.overfit_one_instance or config.policy_mode == "order_only") else []
+    fifo_cmax = _reference_value(reference_rows, "FIFO") if reference_rows else float("nan")
+    greedy_cmax = _reference_value(reference_rows, "GreedyECT") if reference_rows else float("nan")
+    random_cmax = _reference_value(reference_rows, "Random") if reference_rows else float("nan")
+    bc_stats = {"bc_loss": 0.0, "bc_accuracy": 0.0}
+    if config.bc_pretrain:
+        expert_samples = _load_or_create_expert_samples(train_instances, config)
+        bc_stats = agent.behavior_clone_job_head(expert_samples, epochs=config.bc_epochs)
 
     progress = tqdm(
         range(1, config.episodes + 1),
@@ -245,10 +333,7 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
             for key, value in step_legal.items():
                 legal_split_totals[key] += value
             action, logprob, value = agent.select_action(obs, masks, greedy=False)
-            if config.action_mode == "two_head":
-                next_obs, reward, done, info, _ = wrapper.step_two_head(int(action[0]), int(action[1]))
-            else:
-                next_obs, reward, done, info, _ = wrapper.step(int(action))
+            next_obs, reward, done, info, _ = _step_with_policy_mode(wrapper, config, action)
             buffer.add(obs, action, logprob, reward, done, value, masks)
             raw_episode_reward += float(info.get("raw_reward", 0.0))
             scaled_episode_reward += reward
@@ -329,6 +414,12 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
             "selected_split_2_count": split_dist.get(2, 0),
             "selected_split_3_count": split_dist.get(3, 0),
             "selected_split_4_count": split_dist.get(4, 0),
+            "policy_mode": config.policy_mode,
+            "split_rule": config.split_rule,
+            "bc_loss": bc_stats["bc_loss"] if config.bc_pretrain else "",
+            "bc_accuracy": bc_stats["bc_accuracy"] if config.bc_pretrain else "",
+            "bc_epochs": config.bc_epochs if config.bc_pretrain else "",
+            "expert_heuristic": config.expert_heuristic if config.bc_pretrain else "",
             **obs_stats,
             **update_stats,
             **eval_values,
@@ -346,20 +437,21 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
             }
         )
 
-    log_path = Path("data/logs") / f"ppo_train_{config.size}_{run_label}.csv"
+    log_path = Path("data/logs") / f"{artifact_stem}.csv" if config.policy_mode == "order_only" else Path("data/logs") / f"ppo_train_{config.size}_{run_label}.csv"
     _write_csv(log_path, rows)
     agent.save(last_agent_path)
     if best_eval == float("inf"):
         agent.save(best_agent_path)
-    gantt_prefix = f"data/results/ppo/gantt/gantt_ppo_{config.size}_{run_label}"
+    gantt_prefix = f"data/results/ppo/gantt/gantt_{artifact_stem}"
     final_eval = evaluate_agent(agent, test_instances, config, save_gantt_prefix=gantt_prefix)
-    heuristic_rows = overfit_reference_rows if config.overfit_one_instance else evaluate_heuristics_fixed(config.size)
-    eval_path = Path("data/results/ppo") / f"ppo_eval_{config.size}_{run_label}.csv"
+    heuristic_rows = reference_rows if (config.overfit_one_instance or config.policy_mode == "order_only") else evaluate_heuristics_fixed(config.size)
+    eval_path = Path("data/results/ppo") / f"{artifact_stem}_eval.csv" if config.policy_mode == "order_only" else Path("data/results/ppo") / f"ppo_eval_{config.size}_{run_label}.csv"
     _write_eval(eval_path, final_eval, heuristic_rows)
-    create_training_plots(log_path, config.size, run_label)
-    create_split_distribution_plot(all_split_counts, config.size, run_label)
-    create_legal_vs_selected_split_plot(log_path, config.size, run_label)
-    create_comparison_plots(config.size, run_label, final_eval, heuristic_rows)
+    plot_size = f"{config.policy_mode}{'_bc' if config.bc_pretrain else ''}_{config.size}" if config.policy_mode == "order_only" else config.size
+    create_training_plots(log_path, plot_size, run_label)
+    create_split_distribution_plot(all_split_counts, plot_size, run_label)
+    create_legal_vs_selected_split_plot(log_path, plot_size, run_label)
+    create_comparison_plots(plot_size, run_label, final_eval, heuristic_rows)
     if not config.overfit_one_instance:
         update_episode_sensitivity()
     print(f"saved log: {log_path}")
@@ -385,7 +477,12 @@ def debug_ppo(config: PPOConfig) -> None:
     masks = wrapper.get_policy_masks()
     action, logprob, value = agent.select_action(obs, masks, greedy=False)
     entropy_stats = agent.action_debug_stats(obs, masks, action)
-    if config.action_mode == "two_head":
+    if config.policy_mode == "order_only":
+        selected_job_slot = int(action[0])
+        next_obs, reward, done, info, _ = wrapper.step_order_only(selected_job_slot)
+        selected_job = wrapper.jobs[selected_job_slot].job_id
+        selected_split_num = int(info.get("selected_split_num", 0))
+    elif config.action_mode == "two_head":
         selected_job_slot = int(action[0])
         selected_split_idx = int(action[1])
         next_obs, reward, done, info, _ = wrapper.step_two_head(selected_job_slot, selected_split_idx)
@@ -401,12 +498,8 @@ def debug_ppo(config: PPOConfig) -> None:
     while not wrapper.env.is_done():
         masks = wrapper.get_policy_masks()
         action, logprob, value = agent.select_action(next_obs, masks, greedy=False)
-        if config.action_mode == "two_head":
-            current_obs = next_obs
-            next_obs, reward, done, info, _ = wrapper.step_two_head(int(action[0]), int(action[1]))
-        else:
-            current_obs = next_obs
-            next_obs, reward, done, info, _ = wrapper.step(int(action))
+        current_obs = next_obs
+        next_obs, reward, done, info, _ = _step_with_policy_mode(wrapper, config, action)
         buffer.add(current_obs, action, logprob, reward, done, value, masks)
 
     batch = buffer.compute_returns_advantages(

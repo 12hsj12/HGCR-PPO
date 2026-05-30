@@ -30,6 +30,12 @@ def main() -> None:
     parser.add_argument("--overfit_one_instance", action="store_true")
     parser.add_argument("--instance_index", type=int, default=0)
     parser.add_argument("--split", choices=["train", "test"], default="train")
+    parser.add_argument("--policy_mode", choices=["order_split", "order_only"], default="order_split")
+    parser.add_argument("--split_rule", choices=["min1", "max_feasible", "greedy_ect"], default="greedy_ect")
+    parser.add_argument("--bc_pretrain", action="store_true")
+    parser.add_argument("--bc_epochs", type=int, default=20)
+    parser.add_argument("--expert_heuristic", default="GreedyECT")
+    parser.add_argument("--regenerate_expert", action="store_true")
     args = parser.parse_args()
     config = PPOConfig(
         size=args.size,
@@ -39,6 +45,12 @@ def main() -> None:
         overfit_one_instance=args.overfit_one_instance,
         instance_index=args.instance_index,
         overfit_split=args.split,
+        policy_mode=args.policy_mode,
+        split_rule=args.split_rule,
+        bc_pretrain=args.bc_pretrain,
+        bc_epochs=args.bc_epochs,
+        expert_heuristic=args.expert_heuristic,
+        regenerate_expert=args.regenerate_expert,
     )
     train_ppo, debug_ppo = _load_train_ppo()
     if args.debug:

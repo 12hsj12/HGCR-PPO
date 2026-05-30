@@ -31,6 +31,15 @@ class PPOAgent:
     def select_action(self, obs: np.ndarray, masks, greedy: bool = False) -> Tuple[np.ndarray | int, float, float]:
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
+            if self.config.policy_mode == "order_only":
+                job_mask = torch.tensor(masks["job"], dtype=torch.bool, device=self.device).unsqueeze(0)
+                job_logits, _, value = self.model(obs_t)
+                job_dist = torch.distributions.Categorical(logits=job_logits.masked_fill(~job_mask, -1e9))
+                job_action = torch.argmax(job_dist.probs, dim=-1) if greedy else job_dist.sample()
+                logprob = job_dist.log_prob(job_action)
+                action = np.array([int(job_action.item()), 0], dtype=np.int64)
+                return action, float(logprob.item()), float(value.item())
+
             if self.config.action_mode == "two_head":
                 job_mask = torch.tensor(masks["job"], dtype=torch.bool, device=self.device).unsqueeze(0)
                 split_masks = torch.tensor(masks["split"], dtype=torch.bool, device=self.device).unsqueeze(0)
@@ -82,12 +91,19 @@ class PPOAgent:
             for start in range(0, n, batch_size):
                 mb_idx = indices[start : start + batch_size]
                 if self.config.action_mode == "two_head":
-                    logprobs, values, entropy, job_entropy, split_entropy = self._two_head_eval(
-                        obs[mb_idx],
-                        actions[mb_idx],
-                        job_masks[mb_idx],
-                        split_masks[mb_idx],
-                    )
+                    if self.config.policy_mode == "order_only":
+                        logprobs, values, entropy, job_entropy, split_entropy = self._order_only_eval(
+                            obs[mb_idx],
+                            actions[mb_idx],
+                            job_masks[mb_idx],
+                        )
+                    else:
+                        logprobs, values, entropy, job_entropy, split_entropy = self._two_head_eval(
+                            obs[mb_idx],
+                            actions[mb_idx],
+                            job_masks[mb_idx],
+                            split_masks[mb_idx],
+                        )
                 else:
                     dist, values = self.model.masked_distribution(obs[mb_idx], flat_masks[mb_idx])
                     action_ids = actions[mb_idx, 0]
@@ -104,7 +120,10 @@ class PPOAgent:
 
                 if self.config.action_mode == "two_head":
                     job_coef, split_coef = self._entropy_coefs(episode)
-                    entropy_bonus = job_coef * job_entropy + split_coef * split_entropy
+                    if self.config.policy_mode == "order_only":
+                        entropy_bonus = job_coef * job_entropy
+                    else:
+                        entropy_bonus = job_coef * job_entropy + split_coef * split_entropy
                 else:
                     entropy_bonus = self._entropy_coef(episode) * entropy
                 loss = policy_loss + self.config.value_coef * value_loss - entropy_bonus
@@ -163,6 +182,12 @@ class PPOAgent:
     def action_debug_stats(self, obs: np.ndarray, masks, action) -> Dict[str, float]:
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
+            if self.config.policy_mode == "order_only":
+                job_mask = torch.tensor(masks["job"], dtype=torch.bool, device=self.device).unsqueeze(0)
+                job_logits, _, _ = self.model(obs_t)
+                job_dist = torch.distributions.Categorical(logits=job_logits.masked_fill(~job_mask, -1e9))
+                return {"job_entropy": float(job_dist.entropy().item()), "split_entropy": 0.0}
+
             if self.config.action_mode == "two_head":
                 job_mask = torch.tensor(masks["job"], dtype=torch.bool, device=self.device).unsqueeze(0)
                 split_masks = torch.tensor(masks["split"], dtype=torch.bool, device=self.device).unsqueeze(0)
@@ -194,6 +219,52 @@ class PPOAgent:
         job_entropy = job_dist.entropy().mean()
         split_entropy = split_dist.entropy().mean()
         return logprobs, values, job_entropy + split_entropy, job_entropy, split_entropy
+
+    def _order_only_eval(self, obs, actions, job_masks):
+        job_actions = actions[:, 0]
+        job_logits, _, values = self.model(obs)
+        job_dist = torch.distributions.Categorical(logits=job_logits.masked_fill(~job_masks.bool(), -1e9))
+        logprobs = job_dist.log_prob(job_actions)
+        job_entropy = job_dist.entropy().mean()
+        split_entropy = torch.zeros((), device=self.device)
+        return logprobs, values, job_entropy, job_entropy, split_entropy
+
+    def behavior_clone_job_head(self, expert_samples, epochs: int = 20, batch_size: int | None = None) -> Dict[str, float]:
+        if not expert_samples or epochs <= 0:
+            return {"bc_loss": 0.0, "bc_accuracy": 0.0}
+
+        obs = torch.tensor(np.array([sample["observation"] for sample in expert_samples]), dtype=torch.float32, device=self.device)
+        masks = torch.tensor(np.array([sample["job_mask"] for sample in expert_samples]), dtype=torch.bool, device=self.device)
+        targets = torch.tensor([sample["expert_job_slot"] for sample in expert_samples], dtype=torch.long, device=self.device)
+        n = len(targets)
+        batch_size = min(batch_size or self.config.minibatch_size, n)
+        last_loss = 0.0
+        last_acc = 0.0
+
+        self.train()
+        for _ in range(epochs):
+            indices = torch.randperm(n, device=self.device)
+            correct = 0
+            total = 0
+            loss_sum = 0.0
+            for start in range(0, n, batch_size):
+                idx = indices[start : start + batch_size]
+                job_logits, _, _ = self.model(obs[idx])
+                logits = job_logits.masked_fill(~masks[idx], -1e9)
+                loss = nn.functional.cross_entropy(logits, targets[idx])
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                self.optimizer.step()
+
+                with torch.no_grad():
+                    pred = torch.argmax(logits, dim=-1)
+                    correct += int((pred == targets[idx]).sum().item())
+                    total += int(len(idx))
+                    loss_sum += float(loss.item()) * len(idx)
+            last_loss = loss_sum / max(1, total)
+            last_acc = correct / max(1, total)
+        return {"bc_loss": last_loss, "bc_accuracy": last_acc}
 
     def _value_loss(self, values, returns, old_values):
         value_pred = values

@@ -32,6 +32,12 @@ class PPOConfig:
     alpha_final_reward: float = 0.01
     eval_interval: int = 10
     action_mode: str = "two_head"
+    policy_mode: str = "order_split"
+    split_rule: str = "greedy_ect"
+    bc_pretrain: bool = False
+    bc_epochs: int = 20
+    expert_heuristic: str = "GreedyECT"
+    regenerate_expert: bool = False
     reward_mode: str = "normalized_delta_plus_baseline_final"
     reward_scale: float = 1.0
     reward_clip: float = 1.0
