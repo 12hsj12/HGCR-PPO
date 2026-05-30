@@ -181,7 +181,11 @@ def _run_label(config: PPOConfig) -> str:
 
 def _legal_split_counts(wrapper: VectorSchedulingWrapper) -> Dict[int, int]:
     masks = wrapper.get_split_masks()
-    return {idx: int(masks[:, idx - 1].sum()) for idx in range(1, 5)}
+    counts = {}
+    for split_num in range(1, 5):
+        column = split_num - 1
+        counts[split_num] = int(masks[:, column].sum()) if column < masks.shape[1] else 0
+    return counts
 
 
 def _select_train_eval_instances(config: PPOConfig):
@@ -212,7 +216,7 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
     best_agent_path = Path("data/models") / f"ppo_{config.size}_{run_label}_best.pt"
     last_agent_path = Path("data/models") / f"ppo_{config.size}_{run_label}_last.pt"
     final_eval = None
-    all_split_counts = {i: 0 for i in range(1, config.limits["max_split"] + 1)}
+    all_split_counts = {i: 0 for i in range(1, 5)}
     overfit_reference_rows = _run_reference_heuristics(train_instances[0]) if config.overfit_one_instance else []
     fifo_cmax = _reference_value(overfit_reference_rows, "FIFO") if config.overfit_one_instance else float("nan")
     greedy_cmax = _reference_value(overfit_reference_rows, "GreedyECT") if config.overfit_one_instance else float("nan")
