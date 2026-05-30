@@ -122,6 +122,7 @@ class PPOAgent:
                 stats["policy_loss"] += float(policy_loss.item())
                 stats["value_loss"] += float(value_loss.item())
                 stats["entropy"] += float(entropy.item())
+                stats["total_entropy"] += float(entropy.item())
                 stats["job_entropy"] += float(job_entropy.item())
                 stats["split_entropy"] += float(split_entropy.item())
                 stats["approx_kl"] += float(approx_kl.item())
@@ -158,6 +159,27 @@ class PPOAgent:
 
     def eval(self) -> None:
         self.model.eval()
+
+    def action_debug_stats(self, obs: np.ndarray, masks, action) -> Dict[str, float]:
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            if self.config.action_mode == "two_head":
+                job_mask = torch.tensor(masks["job"], dtype=torch.bool, device=self.device).unsqueeze(0)
+                split_masks = torch.tensor(masks["split"], dtype=torch.bool, device=self.device).unsqueeze(0)
+                action_t = torch.tensor([int(action[0])], dtype=torch.long, device=self.device)
+                job_dist, split_dist, _ = self.model.masked_two_head_distributions(
+                    obs_t,
+                    job_mask,
+                    selected_job=action_t,
+                    split_masks=split_masks,
+                )
+                return {
+                    "job_entropy": float(job_dist.entropy().item()),
+                    "split_entropy": float(split_dist.entropy().item()),
+                }
+            flat_mask = torch.tensor(masks["flat"], dtype=torch.bool, device=self.device).unsqueeze(0)
+            dist, _ = self.model.masked_distribution(obs_t, flat_mask)
+            return {"job_entropy": 0.0, "split_entropy": float(dist.entropy().item())}
 
     def _two_head_eval(self, obs, actions, job_masks, split_masks):
         job_actions = actions[:, 0]
@@ -218,6 +240,7 @@ class PPOAgent:
             "policy_loss": 0.0,
             "value_loss": 0.0,
             "entropy": 0.0,
+            "total_entropy": 0.0,
             "job_entropy": 0.0,
             "split_entropy": 0.0,
             "approx_kl": 0.0,

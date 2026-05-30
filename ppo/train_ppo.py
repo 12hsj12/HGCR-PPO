@@ -54,6 +54,7 @@ LOG_FIELDS = [
     "policy_loss",
     "value_loss",
     "entropy",
+    "total_entropy",
     "job_entropy",
     "split_entropy",
     "approx_kl",
@@ -289,6 +290,7 @@ def debug_ppo(config: PPOConfig) -> None:
     buffer = RolloutBuffer()
     masks = wrapper.get_policy_masks()
     action, logprob, value = agent.select_action(obs, masks, greedy=False)
+    entropy_stats = agent.action_debug_stats(obs, masks, action)
     if config.action_mode == "two_head":
         selected_job_slot = int(action[0])
         selected_split_idx = int(action[1])
@@ -320,14 +322,32 @@ def debug_ppo(config: PPOConfig) -> None:
     )
 
     metrics = compute_metrics(wrapper.env)
+    split_dist = wrapper.split_distribution()
+    total_split_choices = max(1, sum(split_dist.values()))
     print(f"observation shape: {obs.shape}")
-    print(f"action mask shape: {masks['flat'].shape}")
-    print(f"legal action count: {int(masks['flat'].sum())}")
+    print(
+        f"obs_mean/std/min/max: {obs.mean():.6f}/{obs.std():.6f}/"
+        f"{obs.min():.6f}/{obs.max():.6f}"
+    )
+    if np.max(np.abs(obs)) > 20:
+        print("WARNING: observation contains absolute values greater than 20.")
+    print(f"job_mask shape: {masks['job'].shape}")
+    print(f"split_mask shape: {masks['split'].shape}")
+    print(f"legal job count: {int(masks['job'].sum())}")
     print(f"sample action: {action}")
-    print(f"selected job: {selected_job}")
+    print(f"selected job_id: {selected_job}")
     print(f"selected split_num: {selected_split_num}")
-    print(f"reward raw/scaled: {first_info.get('raw_reward', 0.0):.6f}/{first_reward:.6f}")
+    print(f"raw_reward: {first_info.get('raw_reward', 0.0):.6f}")
+    print(f"scaled_reward: {first_reward:.6f}")
     print(f"reference_Cmax: {wrapper.reference_cmax:.6f}")
-    print(f"one episode final_Cmax: {metrics['Cmax_roll']:.6f}")
+    print(f"final_Cmax: {metrics['Cmax_roll']:.6f}")
     print(f"advantage mean/std: {batch.stats['advantage_mean']:.6f}/{batch.stats['advantage_std']:.6f}")
     print(f"return mean/std: {batch.stats['return_mean']:.6f}/{batch.stats['return_std']:.6f}")
+    print(f"job_entropy / split_entropy: {entropy_stats['job_entropy']:.6f}/{entropy_stats['split_entropy']:.6f}")
+    print(
+        "split_num ratios: "
+        f"1={split_dist.get(1, 0) / total_split_choices:.3f}, "
+        f"2={split_dist.get(2, 0) / total_split_choices:.3f}, "
+        f"3={split_dist.get(3, 0) / total_split_choices:.3f}, "
+        f"4={split_dist.get(4, 0) / total_split_choices:.3f}"
+    )

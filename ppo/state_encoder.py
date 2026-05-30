@@ -239,7 +239,11 @@ class VectorSchedulingWrapper:
         if self.config.reward_mode != "normalized_delta_plus_baseline_final":
             reward = raw_reward * self.config.reward_scale
             if done:
-                reward += -self.config.alpha_final_reward * info["final_makespan"]
+                final_cmax = info["final_makespan"]
+                final_reward = self.config.final_reward_beta * (self.reference_cmax - final_cmax) / self.reference_cmax
+                if self.config.reward_clip is not None:
+                    final_reward = float(np.clip(final_reward, -self.config.reward_clip, self.config.reward_clip))
+                reward += final_reward
             return reward
 
         reward = raw_reward / self.reference_cmax if self.config.use_reward_normalization else raw_reward
@@ -248,9 +252,15 @@ class VectorSchedulingWrapper:
         if done:
             final_cmax = info["final_makespan"]
             if self.config.use_reward_normalization:
-                reward += self.config.final_reward_beta * (self.reference_cmax - final_cmax) / self.reference_cmax
+                final_reward = self.config.final_reward_beta * (self.reference_cmax - final_cmax) / self.reference_cmax
+                if self.config.reward_clip is not None:
+                    final_reward = float(np.clip(final_reward, -self.config.reward_clip, self.config.reward_clip))
+                reward += final_reward
             else:
-                reward += -self.config.alpha_final_reward * final_cmax
+                final_reward = self.config.final_reward_beta * (self.reference_cmax - final_cmax) / self.reference_cmax
+                if self.config.reward_clip is not None:
+                    final_reward = float(np.clip(final_reward, -self.config.reward_clip, self.config.reward_clip))
+                reward += final_reward
         return reward * self.config.reward_scale
 
     def _estimate_reference_cmax(self) -> float:

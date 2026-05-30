@@ -69,6 +69,20 @@ def create_training_plots(log_path: str, size: str, episodes: int) -> None:
         "PPO reward",
         "reward",
     )
+    _save_line(
+        base / f"reward_curve_raw_{size}_{episodes}.png",
+        x,
+        {"raw_episode_reward": _float(rows, "raw_episode_reward")},
+        "PPO raw reward",
+        "raw reward",
+    )
+    _save_line(
+        base / f"reward_curve_scaled_{size}_{episodes}.png",
+        x,
+        {"scaled_episode_reward": _float(rows, "scaled_episode_reward")},
+        "PPO scaled reward",
+        "scaled reward",
+    )
     _save_eval_line(
         base / f"cmax_curve_{size}_{episodes}.png",
         x,
@@ -88,7 +102,7 @@ def create_training_plots(log_path: str, size: str, episodes: int) -> None:
         base / f"entropy_curve_{size}_{episodes}.png",
         x,
         {
-            "total_entropy": _float(rows, "entropy"),
+            "total_entropy": _float(rows, "total_entropy"),
             "job_entropy": _float(rows, "job_entropy"),
             "split_entropy": _float(rows, "split_entropy"),
         },
