@@ -53,6 +53,9 @@ class PPOConfig:
     utilization_bonus: float = 0.0
     train_split: str = "train"
     test_split: str = "test"
+    overfit_one_instance: bool = False
+    instance_index: int = 0
+    overfit_split: str = "train"
 
     @property
     def limits(self) -> dict:

@@ -33,7 +33,7 @@ def _save_line(path: Path, x, series, title: str, ylabel: str) -> None:
     plt.close(fig)
 
 
-def _save_eval_line(path: Path, x, train_values, eval_values, title: str, ylabel: str) -> None:
+def _save_eval_line(path: Path, x, train_values, eval_values, title: str, ylabel: str, reference_lines=None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8, 4.6))
     ax.plot(x, train_values, label="train_final_Cmax")
@@ -45,6 +45,9 @@ def _save_eval_line(path: Path, x, train_values, eval_values, title: str, ylabel
             eval_y.append(value)
     if eval_x:
         ax.plot(eval_x, eval_y, marker="o", label="eval_Cmax_mean")
+    for label, value in (reference_lines or {}).items():
+        if value == value:
+            ax.axhline(value, linestyle="--", linewidth=1.2, label=label)
     ax.set_xlabel("episode")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
@@ -55,10 +58,20 @@ def _save_eval_line(path: Path, x, train_values, eval_values, title: str, ylabel
     plt.close(fig)
 
 
-def create_training_plots(log_path: str, size: str, episodes: int) -> None:
+def create_training_plots(log_path: str, size: str, episodes: int | str) -> None:
     rows = _read_csv(log_path)
     x = [int(row["episode"]) for row in rows]
     base = Path("data/results/ppo/plots")
+    reference_lines = {}
+    for label, key in [
+        ("FIFO_Cmax", "FIFO_Cmax"),
+        ("GreedyECT_Cmax", "GreedyECT_Cmax"),
+        ("Random_Cmax", "Random_Cmax"),
+        ("Best_PPO_Cmax", "best_eval_Cmax"),
+    ]:
+        values = [value for value in _float(rows, key) if value == value] if rows and key in rows[0] else []
+        if values:
+            reference_lines[label] = min(values) if key == "best_eval_Cmax" else values[-1]
     _save_line(
         base / f"reward_curve_{size}_{episodes}.png",
         x,
@@ -90,6 +103,7 @@ def create_training_plots(log_path: str, size: str, episodes: int) -> None:
         _float(rows, "eval_Cmax_mean"),
         "PPO Cmax",
         "Cmax",
+        reference_lines=reference_lines,
     )
     _save_line(
         base / f"loss_curve_{size}_{episodes}.png",
@@ -141,7 +155,7 @@ def create_training_plots(log_path: str, size: str, episodes: int) -> None:
     )
 
 
-def create_split_distribution_plot(counts: Dict[int, int], size: str, episodes: int) -> None:
+def create_split_distribution_plot(counts: Dict[int, int], size: str, episodes: int | str) -> None:
     path = Path("data/results/ppo/plots") / f"split_num_distribution_{size}_{episodes}.png"
     path.parent.mkdir(parents=True, exist_ok=True)
     xs = sorted(counts)
@@ -155,7 +169,35 @@ def create_split_distribution_plot(counts: Dict[int, int], size: str, episodes: 
     plt.close(fig)
 
 
-def create_comparison_plots(size: str, episodes: int, ppo_metrics: Dict[str, float], heuristic_rows: List[Dict[str, float]]) -> None:
+def create_legal_vs_selected_split_plot(log_path: str, size: str, episodes: int | str) -> None:
+    rows = _read_csv(log_path)
+    legal = [
+        sum(_float(rows, f"legal_split_{idx}_count"))
+        for idx in range(1, 5)
+    ]
+    selected = [
+        sum(_float(rows, f"selected_split_{idx}_count"))
+        for idx in range(1, 5)
+    ]
+    labels = ["1", "2", "3", "4"]
+    x = range(len(labels))
+    path = Path("data/results/ppo/plots") / f"legal_vs_selected_split_{size}_{episodes}.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7, 4.4))
+    ax.bar([i - 0.18 for i in x], legal, width=0.36, label="legal")
+    ax.bar([i + 0.18 for i in x], selected, width=0.36, label="selected")
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels)
+    ax.set_xlabel("split_num")
+    ax.set_ylabel("count")
+    ax.set_title("Legal vs selected split numbers")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
+def create_comparison_plots(size: str, episodes: int | str, ppo_metrics: Dict[str, float], heuristic_rows: List[Dict[str, float]]) -> None:
     methods = ["PPO"] + [row["method"] for row in heuristic_rows]
     comparisons = [
         ("cmax", "Cmax_roll", ppo_metrics["test_Cmax_mean"], "Cmax"),

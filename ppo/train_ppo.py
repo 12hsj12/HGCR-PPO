@@ -17,6 +17,7 @@ from dataset_manager import generate_fixed_datasets, load_dataset
 from ppo.evaluate_ppo import evaluate_agent, evaluate_heuristics_fixed
 from ppo.plot_training import (
     create_comparison_plots,
+    create_legal_vs_selected_split_plot,
     create_split_distribution_plot,
     create_training_plots,
     update_episode_sensitivity,
@@ -85,6 +86,22 @@ LOG_FIELDS = [
     "eval_total_split_count",
     "best_eval_Cmax",
     "best_model_path",
+    "overfit_one_instance",
+    "instance_index",
+    "reference_heuristic",
+    "FIFO_Cmax",
+    "GreedyECT_Cmax",
+    "Random_Cmax",
+    "relative_improvement_vs_FIFO",
+    "relative_improvement_vs_GreedyECT",
+    "legal_split_1_count",
+    "legal_split_2_count",
+    "legal_split_3_count",
+    "legal_split_4_count",
+    "selected_split_1_count",
+    "selected_split_2_count",
+    "selected_split_3_count",
+    "selected_split_4_count",
 ]
 
 
@@ -138,22 +155,68 @@ def _write_eval(path: str | Path, metrics: Dict[str, float], heuristic_rows: Lis
         writer.writerow(row)
 
 
+def _run_reference_heuristics(instance) -> List[Dict[str, float]]:
+    from src.baselines.heuristics import run_heuristic
+
+    rows = []
+    for method in ["Random", "FIFO", "GreedyECT"]:
+        result = run_heuristic(instance, method)
+        rows.append({"method": method, **result.metrics})
+    return rows
+
+
+def _reference_value(rows: List[Dict[str, float]], method: str) -> float:
+    for row in rows:
+        if row["method"] == method:
+            return float(row["Cmax_roll"])
+    return float("nan")
+
+
+def _run_label(config: PPOConfig) -> str:
+    label = str(config.episodes)
+    if config.overfit_one_instance:
+        label += f"_overfit{config.instance_index}"
+    return label
+
+
+def _legal_split_counts(wrapper: VectorSchedulingWrapper) -> Dict[int, int]:
+    masks = wrapper.get_split_masks()
+    return {idx: int(masks[:, idx - 1].sum()) for idx in range(1, 5)}
+
+
+def _select_train_eval_instances(config: PPOConfig):
+    if config.overfit_one_instance:
+        instances = load_dataset(config.size, config.overfit_split)
+        if config.instance_index < 0 or config.instance_index >= len(instances):
+            raise IndexError(
+                f"instance_index={config.instance_index} out of range for "
+                f"{config.size}/{config.overfit_split}; available={len(instances)}"
+            )
+        instance = instances[config.instance_index]
+        return [instance], [instance]
+    return load_dataset(config.size, "train"), load_dataset(config.size, "test")
+
+
 def train_ppo(config: PPOConfig) -> Dict[str, float]:
     _ensure_dirs()
     _set_seed(config.seed)
     generate_fixed_datasets(regenerate=False)
-    train_instances = load_dataset(config.size, "train")
-    test_instances = load_dataset(config.size, "test")
+    train_instances, test_instances = _select_train_eval_instances(config)
 
     probe = VectorSchedulingWrapper(train_instances[0], config)
     agent = PPOAgent(probe.obs_dim, probe.action_dim, config)
     buffer = RolloutBuffer()
     rows = []
     best_eval = float("inf")
-    best_agent_path = Path("data/models") / f"ppo_{config.size}_{config.episodes}_best.pt"
-    last_agent_path = Path("data/models") / f"ppo_{config.size}_{config.episodes}_last.pt"
+    run_label = _run_label(config)
+    best_agent_path = Path("data/models") / f"ppo_{config.size}_{run_label}_best.pt"
+    last_agent_path = Path("data/models") / f"ppo_{config.size}_{run_label}_last.pt"
     final_eval = None
     all_split_counts = {i: 0 for i in range(1, config.limits["max_split"] + 1)}
+    overfit_reference_rows = _run_reference_heuristics(train_instances[0]) if config.overfit_one_instance else []
+    fifo_cmax = _reference_value(overfit_reference_rows, "FIFO") if config.overfit_one_instance else float("nan")
+    greedy_cmax = _reference_value(overfit_reference_rows, "GreedyECT") if config.overfit_one_instance else float("nan")
+    random_cmax = _reference_value(overfit_reference_rows, "Random") if config.overfit_one_instance else float("nan")
 
     progress = tqdm(
         range(1, config.episodes + 1),
@@ -170,9 +233,13 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
         raw_episode_reward = 0.0
         scaled_episode_reward = 0.0
         mask_ratios = []
+        legal_split_totals = {idx: 0 for idx in range(1, 5)}
 
         while not done:
             masks = wrapper.get_policy_masks()
+            step_legal = _legal_split_counts(wrapper)
+            for key, value in step_legal.items():
+                legal_split_totals[key] += value
             action, logprob, value = agent.select_action(obs, masks, greedy=False)
             if config.action_mode == "two_head":
                 next_obs, reward, done, info, _ = wrapper.step_two_head(int(action[0]), int(action[1]))
@@ -192,6 +259,8 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
             all_split_counts[key] = all_split_counts.get(key, 0) + value
         avg_split = mean(wrapper.selected_split_nums) if wrapper.selected_split_nums else 0.0
         relative_improvement = (wrapper.reference_cmax - metrics["Cmax_roll"]) / wrapper.reference_cmax
+        relative_vs_fifo = (fifo_cmax - metrics["Cmax_roll"]) / fifo_cmax if fifo_cmax == fifo_cmax and fifo_cmax > 0 else ""
+        relative_vs_greedy = (greedy_cmax - metrics["Cmax_roll"]) / greedy_cmax if greedy_cmax == greedy_cmax and greedy_cmax > 0 else ""
 
         eval_values = _empty_eval()
         if episode % config.eval_interval == 0 or episode == config.episodes:
@@ -240,6 +309,22 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
             "action_mask_ratio": mean(mask_ratios) if mask_ratios else 0.0,
             "best_eval_Cmax": best_eval if best_eval < float("inf") else "",
             "best_model_path": str(best_agent_path),
+            "overfit_one_instance": config.overfit_one_instance,
+            "instance_index": config.instance_index if config.overfit_one_instance else "",
+            "reference_heuristic": config.reference_baseline,
+            "FIFO_Cmax": fifo_cmax if fifo_cmax == fifo_cmax else "",
+            "GreedyECT_Cmax": greedy_cmax if greedy_cmax == greedy_cmax else "",
+            "Random_Cmax": random_cmax if random_cmax == random_cmax else "",
+            "relative_improvement_vs_FIFO": relative_vs_fifo,
+            "relative_improvement_vs_GreedyECT": relative_vs_greedy,
+            "legal_split_1_count": legal_split_totals.get(1, 0),
+            "legal_split_2_count": legal_split_totals.get(2, 0),
+            "legal_split_3_count": legal_split_totals.get(3, 0),
+            "legal_split_4_count": legal_split_totals.get(4, 0),
+            "selected_split_1_count": split_dist.get(1, 0),
+            "selected_split_2_count": split_dist.get(2, 0),
+            "selected_split_3_count": split_dist.get(3, 0),
+            "selected_split_4_count": split_dist.get(4, 0),
             **obs_stats,
             **update_stats,
             **eval_values,
@@ -257,20 +342,22 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
             }
         )
 
-    log_path = Path("data/logs") / f"ppo_train_{config.size}_{config.episodes}.csv"
+    log_path = Path("data/logs") / f"ppo_train_{config.size}_{run_label}.csv"
     _write_csv(log_path, rows)
     agent.save(last_agent_path)
     if best_eval == float("inf"):
         agent.save(best_agent_path)
-    gantt_prefix = f"data/results/ppo/gantt/gantt_ppo_{config.size}_{config.episodes}"
+    gantt_prefix = f"data/results/ppo/gantt/gantt_ppo_{config.size}_{run_label}"
     final_eval = evaluate_agent(agent, test_instances, config, save_gantt_prefix=gantt_prefix)
-    heuristic_rows = evaluate_heuristics_fixed(config.size)
-    eval_path = Path("data/results/ppo") / f"ppo_eval_{config.size}_{config.episodes}.csv"
+    heuristic_rows = overfit_reference_rows if config.overfit_one_instance else evaluate_heuristics_fixed(config.size)
+    eval_path = Path("data/results/ppo") / f"ppo_eval_{config.size}_{run_label}.csv"
     _write_eval(eval_path, final_eval, heuristic_rows)
-    create_training_plots(log_path, config.size, config.episodes)
-    create_split_distribution_plot(all_split_counts, config.size, config.episodes)
-    create_comparison_plots(config.size, config.episodes, final_eval, heuristic_rows)
-    update_episode_sensitivity()
+    create_training_plots(log_path, config.size, run_label)
+    create_split_distribution_plot(all_split_counts, config.size, run_label)
+    create_legal_vs_selected_split_plot(log_path, config.size, run_label)
+    create_comparison_plots(config.size, run_label, final_eval, heuristic_rows)
+    if not config.overfit_one_instance:
+        update_episode_sensitivity()
     print(f"saved log: {log_path}")
     print(f"saved best model: {best_agent_path}")
     print(f"saved last model: {last_agent_path}")
@@ -283,7 +370,10 @@ def debug_ppo(config: PPOConfig) -> None:
 
     _set_seed(config.seed)
     generate_fixed_datasets(regenerate=False)
-    instance = load_dataset(config.size, "train")[0]
+    if config.overfit_one_instance:
+        instance = _select_train_eval_instances(config)[0][0]
+    else:
+        instance = load_dataset(config.size, "train")[0]
     wrapper = VectorSchedulingWrapper(instance, config)
     obs, _ = wrapper.reset(instance)
     agent = PPOAgent(wrapper.obs_dim, wrapper.action_dim, config)
