@@ -181,19 +181,20 @@ def _reference_value(rows: List[Dict[str, float]], method: str) -> float:
     return float("nan")
 
 
-def _run_label(config: PPOConfig) -> str:
+def _episode_label(config: PPOConfig) -> str:
     label = str(config.episodes)
     if config.overfit_one_instance:
         label += f"_overfit{config.instance_index}"
     return label
 
 
+def _experiment_tag(config: PPOConfig) -> str:
+    bc_label = "bc" if config.bc_pretrain else "nobc"
+    return f"{config.policy_mode}_{config.split_rule}_{bc_label}_{config.size}_{_episode_label(config)}"
+
+
 def _artifact_stem(config: PPOConfig) -> str:
-    label = _run_label(config)
-    if config.policy_mode == "order_only":
-        bc = "_bc" if config.bc_pretrain else ""
-        return f"ppo_order_only{bc}_{config.size}_{label}"
-    return f"ppo_{config.size}_{label}"
+    return f"ppo_{_experiment_tag(config)}"
 
 
 def _legal_split_counts(wrapper: VectorSchedulingWrapper) -> Dict[int, int]:
@@ -295,7 +296,8 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
     buffer = RolloutBuffer()
     rows = []
     best_eval = float("inf")
-    run_label = _run_label(config)
+    run_label = _episode_label(config)
+    experiment_tag = _experiment_tag(config)
     artifact_stem = _artifact_stem(config)
     best_agent_path = Path("data/models") / f"{artifact_stem}_best.pt"
     last_agent_path = Path("data/models") / f"{artifact_stem}_last.pt"
@@ -437,7 +439,7 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
             }
         )
 
-    log_path = Path("data/logs") / f"{artifact_stem}.csv" if config.policy_mode == "order_only" else Path("data/logs") / f"ppo_train_{config.size}_{run_label}.csv"
+    log_path = Path("data/logs") / f"ppo_train_{experiment_tag}.csv"
     _write_csv(log_path, rows)
     agent.save(last_agent_path)
     if best_eval == float("inf"):
@@ -445,13 +447,12 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
     gantt_prefix = f"data/results/ppo/gantt/gantt_{artifact_stem}"
     final_eval = evaluate_agent(agent, test_instances, config, save_gantt_prefix=gantt_prefix)
     heuristic_rows = reference_rows if (config.overfit_one_instance or config.policy_mode == "order_only") else evaluate_heuristics_fixed(config.size)
-    eval_path = Path("data/results/ppo") / f"{artifact_stem}_eval.csv" if config.policy_mode == "order_only" else Path("data/results/ppo") / f"ppo_eval_{config.size}_{run_label}.csv"
+    eval_path = Path("data/results/ppo") / f"ppo_eval_{experiment_tag}.csv"
     _write_eval(eval_path, final_eval, heuristic_rows)
-    plot_size = f"{config.policy_mode}{'_bc' if config.bc_pretrain else ''}_{config.size}" if config.policy_mode == "order_only" else config.size
-    create_training_plots(log_path, plot_size, run_label)
-    create_split_distribution_plot(all_split_counts, plot_size, run_label)
-    create_legal_vs_selected_split_plot(log_path, plot_size, run_label)
-    create_comparison_plots(plot_size, run_label, final_eval, heuristic_rows)
+    create_training_plots(log_path, experiment_tag, "")
+    create_split_distribution_plot(all_split_counts, experiment_tag, "")
+    create_legal_vs_selected_split_plot(log_path, experiment_tag, "")
+    create_comparison_plots(experiment_tag, "", final_eval, heuristic_rows)
     if not config.overfit_one_instance:
         update_episode_sensitivity()
     print(f"saved log: {log_path}")
