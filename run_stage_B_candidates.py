@@ -23,8 +23,10 @@ from src.evaluation.metrics import compute_metrics
 
 
 RESULT_DIR = Path("data/results/stage_B")
-DETAIL_CSV = RESULT_DIR / "candidate_ablation.csv"
-SUMMARY_CSV = RESULT_DIR / "candidate_ablation_summary.csv"
+LATEST_DETAIL_CSV = RESULT_DIR / "candidate_ablation_latest.csv"
+LATEST_SUMMARY_CSV = RESULT_DIR / "candidate_ablation_summary_latest.csv"
+ALL_DETAIL_CSV = RESULT_DIR / "candidate_ablation_all.csv"
+ALL_SUMMARY_CSV = RESULT_DIR / "candidate_ablation_summary_all.csv"
 
 METHODS = [
     "all_legal_random",
@@ -46,10 +48,10 @@ METRICS = [
     "inference_time",
 ]
 ROW_FIELDS = [
-    "method",
     "size",
     "split",
     "top_k",
+    "method",
     "instance_id",
     *METRICS,
     *VALIDATION_FIELDS,
@@ -138,7 +140,15 @@ def evaluate_candidate_ablation(
     return rows
 
 
-def write_details(rows: Iterable[Dict], output_path: Path = DETAIL_CSV) -> None:
+def result_paths(size: str, split: str, top_k: int) -> tuple[Path, Path]:
+    suffix = f"{size}_{split}_topk{int(top_k)}"
+    return (
+        RESULT_DIR / f"candidate_ablation_{suffix}.csv",
+        RESULT_DIR / f"candidate_ablation_summary_{suffix}.csv",
+    )
+
+
+def write_details(rows: Iterable[Dict], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=ROW_FIELDS)
@@ -146,7 +156,7 @@ def write_details(rows: Iterable[Dict], output_path: Path = DETAIL_CSV) -> None:
         writer.writerows(rows)
 
 
-def write_summary(rows: Iterable[Dict], output_path: Path = SUMMARY_CSV) -> List[Dict]:
+def write_summary(rows: Iterable[Dict], output_path: Path) -> List[Dict]:
     rows = list(rows)
     grouped: Dict[tuple[str, str, str, int], List[Dict]] = {}
     for row in rows:
@@ -176,6 +186,33 @@ def write_summary(rows: Iterable[Dict], output_path: Path = SUMMARY_CSV) -> List
     return summary_rows
 
 
+def _is_detail_topk_file(path: Path) -> bool:
+    name = path.name
+    return (
+        name.startswith("candidate_ablation_")
+        and "_topk" in name
+        and not name.startswith("candidate_ablation_summary_")
+        and name not in {LATEST_DETAIL_CSV.name, ALL_DETAIL_CSV.name}
+    )
+
+
+def collect_topk_detail_rows(result_dir: Path = RESULT_DIR) -> List[Dict]:
+    rows: List[Dict] = []
+    for path in sorted(result_dir.glob("candidate_ablation_*_topk*.csv")):
+        if not _is_detail_topk_file(path):
+            continue
+        with path.open("r", newline="") as f:
+            rows.extend(csv.DictReader(f))
+    return rows
+
+
+def write_all_outputs(result_dir: Path = RESULT_DIR) -> tuple[Path, Path]:
+    rows = collect_topk_detail_rows(result_dir)
+    write_details(rows, ALL_DETAIL_CSV)
+    write_summary(rows, ALL_SUMMARY_CSV)
+    return ALL_DETAIL_CSV, ALL_SUMMARY_CSV
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--size", choices=SIZES, required=True)
@@ -192,12 +229,18 @@ def main() -> None:
         seed=args.seed,
         max_instances=args.max_instances,
     )
-    write_details(rows)
-    summary_rows = write_summary(rows)
-    print(f"Saved {len(rows)} rows to {DETAIL_CSV}")
-    print(f"Saved {len(summary_rows)} summary rows to {SUMMARY_CSV}")
+    detail_path, summary_path = result_paths(args.size, args.split, args.top_k)
+    write_details(rows, detail_path)
+    write_details(rows, LATEST_DETAIL_CSV)
+    summary_rows = write_summary(rows, summary_path)
+    write_summary(rows, LATEST_SUMMARY_CSV)
+    all_detail_path, all_summary_path = write_all_outputs()
+
+    print(f"Saved {len(rows)} rows to {detail_path}")
+    print(f"Saved {len(summary_rows)} summary rows to {summary_path}")
+    print(f"Updated latest files: {LATEST_DETAIL_CSV}, {LATEST_SUMMARY_CSV}")
+    print(f"Updated all files: {all_detail_path}, {all_summary_path}")
 
 
 if __name__ == "__main__":
     main()
-
