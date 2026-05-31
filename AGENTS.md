@@ -1,534 +1,363 @@
-# AGENTS.md
+﻿# AGENTS.md
 
-## 1. Project Role and Goal
+本文件用于指导 Codex 在当前仓库中继续开发 HGCR-PPO 项目。
 
-You are assisting with a research-code project for a scheduling optimization paper.
-
-The project studies a **rolling scheduling problem with task splitting and unrelated/non-identical parallel production lines** in a steel coil processing center. The short-term coding goal is **not** to build the full deep reinforcement learning method immediately. The immediate goal is to implement a reliable simulation environment, instance generator, heuristic baselines, metrics, and Gantt-chart visualization. This environment will later be connected to PPO and then upgraded to GNN-PPO.
-
-The current algorithmic roadmap is:
-
-```text
-Instance generator
-    ↓
-Rolling scheduling environment
-    ↓
-Heuristic baselines + Gantt-chart validation
-    ↓
-Plain PPO
-    ↓
-GNN + PPO
-    ↓
-GNN + Hierarchical PPO
-```
-
-For now, focus on the first three modules:
-
-1. instance generation;
-2. rolling scheduling environment;
-3. heuristic baselines, evaluation metrics, and visualization.
-
-Do not implement PPO, GNN, or deep learning training unless explicitly requested later.
+重要说明：本文件为中文内容，文件编码为 UTF-8 with BOM。请不要将本文件另存为 ANSI、GBK 或 UTF-16。若在 Windows 中编辑，请使用 VS Code，并确认右下角编码为 UTF-8。
 
 ---
 
-## 2. Core Scheduling Problem
+## 1. 项目定位
 
-The production system comes from a steel processing center operating under a Make-to-Order mode. Customer orders are decomposed into raw material batches. Each raw material batch is the smallest scheduling object.
+当前仓库名称已经由 TSG-PPO 修改为 HGCR-PPO。
 
-The system contains:
+HGCR-PPO 的全称为：
 
-- raw material batches/jobs;
-- process types;
-- production lines/machines;
-- rolling planning periods.
+Heuristic-guided Graph Candidate Ranking Proximal Policy Optimization
 
-The process types are:
+中文名称为：
 
-```text
-sl = slitting
-cu = cross-cutting
-co = compound shearing
-```
+启发式引导的图候选排序近端策略优化算法。
 
-The most important modeling fact is:
+本项目研究对象是：
 
-> Each raw material batch belongs to exactly one process type. There is no fixed technological route such as sl → cu → co.
+面向钢铁加工中心的任务拆分、非等效并行产线、多周期滚动调度问题。
 
-Therefore, do **not** model this as a traditional multi-stage flow shop where every job passes through all stages. This is a single-process-type assignment problem with unrelated parallel lines inside each process type.
+优化目标是：
+
+最小化滚动调度全过程的实际最大完工时间 Cmax_roll。
 
 ---
 
-## 3. Key Modeling Assumptions
+## 2. 当前研究背景
 
-Respect the following assumptions throughout the code.
+原项目已经完成以下基础内容：
 
-1. A customer order can be decomposed into several raw material batches. Raw material batches are independent scheduling objects.
+1. 算例生成器。
+2. 滚动调度环境。
+3. 启发式基线。
+4. 评价指标计算。
+5. 甘特图输出。
+6. small、medium、large 三种规模算例运行。
 
-2. Each raw material batch belongs to exactly one process type.
+阶段二已经充分尝试普通 MLP-PPO、PPO-Order、BC 预训练、freeze actor、小学习率、小 clip ratio、少 update epoch 等方法。
 
-3. Different process types do not have a fixed precedence relationship.
+当前阶段性结论是：
 
-4. Each process type has multiple non-identical parallel production lines.
+普通 MLP-PPO 工程上可以运行，但泛化能力不足。BC-only 有一定帮助，但仍弱于 FIFO、GreedyECT 等启发式。PPO fine-tuning 会破坏 BC 策略。继续单纯调整 PPO 超参数收益很低。
 
-5. A raw material batch can only be processed by eligible production lines belonging to its own process type.
+因此，后续主线不再是继续盲目调普通 PPO，而是转向：
 
-6. A raw material batch may be split across multiple eligible production lines within its own process type.
-
-7. For a split batch, the processing ratios over selected lines must sum to 1.
-
-8. The completion time of a split batch is the latest completion time among all its split sub-tasks.
-
-9. Each production line can process at most one sub-task at a time.
-
-10. Once a sub-task starts on a line, it cannot be interrupted, preempted, or migrated.
-
-11. New jobs enter the system only at the beginning of rolling planning periods.
-
-12. In rolling scheduling, already-started sub-tasks must remain fixed in later periods and cannot be rescheduled.
-
-13. Machine breakdowns, setup times, transportation times, and random processing-time disturbances are not considered at this stage.
-
-14. The optimization objective is to minimize the rolling-process makespan, i.e., the actual final completion time of all jobs.
+固定评价体系
+-> 拆分价值测试
+-> 强启发式候选集
+-> 多专家排序学习
+-> GNN-Ranker
+-> Conservative PPO 微调
 
 ---
 
-## 4. Mathematical-to-Code Mapping
+## 3. 当前阶段目标
 
-Use the following mapping between the mathematical model and the code implementation.
+当前处于阶段 A：重建稳定、可复现、可消融的实验评价体系。
 
-| Mathematical concept | Code concept |
-|---|---|
-| raw material batch `j` | job |
-| process type `q` | process_type |
-| production line `k` | machine |
-| rolling period `h` | rolling_period |
-| job set in period `J^h` | active jobs in current period |
-| newly arrived jobs `J_new^h` | jobs with release time in current period |
-| carried jobs `J_carry^h` | unfinished or tracked jobs from previous periods |
-| processing time `p_jqk` | processing_time[job_id][machine_id] |
-| machine availability `A_k^h` | machine_available_time[machine_id] |
-| earliest job start `E_jq^h` | max(job.release_time, period_start_time) |
-| assignment binary `u_jqk` | selected machine indicator |
-| split ratio `x_jqk` | ratio assigned to a selected machine |
-| start time `S_jqk` | sub-task start time |
-| sub-task completion `C_jqk` | sub-task completion time |
-| job completion `C_j` | max completion among the job's sub-tasks |
-| rolling makespan `Cmax_roll` | max final completion time across all jobs |
+阶段 A 的目标不是训练新模型，也不是实现 GNN 或 PPO。
 
-The environment does not need to directly output all mathematical decision variables. Some variables can be generated by the environment after an action is applied. For example, sequencing variables are implicitly determined by the order in which jobs are scheduled through the environment.
+阶段 A 只做以下事情：
 
----
+1. 固定 train、val、test 数据集。
+2. 统一评估入口。
+3. 统一结果 CSV 格式。
+4. 复测已有启发式基线。
+5. 进行拆分价值测试。
+6. 保存用于论文后续实验的稳定基础结果。
 
-## 5. Action Design for the First Environment Version
+阶段 A 不要做以下事情：
 
-The first reinforcement-learning-compatible environment should use a simplified action:
-
-```python
-action = (job_id, split_num)
-```
-
-where:
-
-- `job_id` is the selected unscheduled job;
-- `split_num` is the number of production lines used for that job.
-
-The environment then automatically:
-
-1. checks whether the job is schedulable;
-2. finds eligible machines from the job's process type;
-3. selects `split_num` machines according to a deterministic rule;
-4. assigns processing ratios according to a deterministic rule;
-5. calculates start and completion times;
-6. updates machine availability;
-7. updates job completion;
-8. updates makespan;
-9. returns next state, reward, done, and info.
-
-This simplified action design is intentional. It keeps the first environment stable and makes it easier to connect plain PPO and GNN-PPO later.
-
-Do not initially require the learning agent to directly output the exact machine subset or continuous split ratios. Those can be introduced later in the hierarchical PPO version.
+1. 不要实现 GNN。
+2. 不要实现 Ranker。
+3. 不要实现 Conservative PPO。
+4. 不要继续调普通 PPO 超参数。
+5. 不要重写已有调度环境。
+6. 不要删除已有核心文件。
 
 ---
 
-## 6. Machine Selection Rule
+## 4. 必须保留的原有文件
 
-After receiving `(job_id, split_num)`, the environment should select machines from the eligible machine set of the job.
+除非明确要求，否则不要删除或大改以下文件：
 
-For each candidate machine `k`, compute the estimated completion time if the full job were assigned to that machine:
+1. run_baselines.py
+2. run_ppo.py
+3. rolling_scheduling_env.py
+4. heuristics.py
+5. metrics.py
+6. visualization.py
+7. instance_generator.py
+8. data/results 中已有历史结果
 
-```text
-ECT(j, k) = max(machine_available_time[k], job.release_time, current_period_start_time) + processing_time[j][k]
-```
+如果需要修改这些文件，必须保持向后兼容。
 
-Select the `split_num` machines with the smallest ECT values.
+尤其要保证：
 
-This rule is a heuristic device used to keep the first environment feasible and stable. It also gives a reasonable industrial interpretation: prioritize lines that can complete the selected job earlier.
+python run_baselines.py
 
----
-
-## 7. Split-Ratio Rule
-
-Once machines are selected, compute split ratios using inverse processing times.
-
-For selected machine set `K_selected`:
-
-```text
-ratio[j, k] = (1 / processing_time[j][k]) / sum(1 / processing_time[j][l] for l in K_selected)
-```
-
-Interpretation:
-
-- faster machines receive larger portions;
-- slower machines receive smaller portions;
-- ratios sum to 1;
-- selected lines tend to finish their assigned portions at similar times.
-
-For a selected machine `k`, the actual processing duration of the sub-task is:
-
-```text
-duration[j, k] = ratio[j, k] * processing_time[j][k]
-```
-
-The job completion time is:
-
-```text
-completion[j] = max(completion[j, k] for k in K_selected)
-```
+仍然可以运行。
 
 ---
 
-## 8. Rolling Scheduling Logic
+## 5. 阶段 A 推荐新增文件
 
-The environment should support rolling periods.
+请优先新增以下文件，而不是推翻已有结构：
 
-At the beginning of rolling period `h`:
+1. instance_manager.py
+   用于生成、保存、加载固定 train、val、test 数据集。
 
-1. the current period start time is `tau_h`;
-2. newly released jobs enter the active job set;
-3. unfinished jobs from previous periods may be tracked as carry-over jobs;
-4. machines may have availability times greater than the current period start time if they are occupied by cross-period sub-tasks;
-5. already-started cross-period sub-tasks should not be modified or rescheduled.
+2. evaluate_methods.py
+   用于统一评估启发式和后续算法。
 
-For the first implementation, it is acceptable to simplify rolling logic as long as the following is respected:
+3. run_stage_A.py
+   用于一键运行阶段 A。
 
-- release times must be enforced;
-- machine availability times must be enforced;
-- already scheduled sub-tasks must not be overlapped by later sub-tasks;
-- makespan must be calculated from actual final completion times.
+4. check_split_effect.py
+   用于测试任务拆分策略对 Cmax 的影响。
 
----
-
-## 9. Reward Design for Later PPO Compatibility
-
-The initial reward should be simple and dense:
-
-```python
-reward = -(new_cmax - old_cmax)
-```
-
-At the end of an episode, return the final rolling makespan in `info`:
-
-```python
-info["final_makespan"] = cmax_roll
-```
-
-This reward is aligned with the objective of minimizing makespan while still providing feedback after each scheduling decision.
-
-Do not overcomplicate the reward function in the first version. Additional reward terms such as load balance, waiting time, or split penalty can be added later.
+5. experiment_registry.py
+   可选，用于统一登记 method、candidate_mode、split_rule 等实验配置。
 
 ---
 
-## 10. Required Project Structure
+## 6. 固定数据集要求
 
-Use a clear modular structure. A suggested structure is:
+固定数据集保存路径建议为：
 
-```text
-project_root/
-│
-├── AGENTS.md
-├── README.md
-├── requirements.txt
-│
-├── data/
-│   ├── generated/
-│   └── results/
-│
-├── src/
-│   ├── __init__.py
-│   │
-│   ├── instances/
-│   │   ├── __init__.py
-│   │   └── instance_generator.py
-│   │
-│   ├── envs/
-│   │   ├── __init__.py
-│   │   └── rolling_scheduling_env.py
-│   │
-│   ├── baselines/
-│   │   ├── __init__.py
-│   │   └── heuristics.py
-│   │
-│   ├── evaluation/
-│   │   ├── __init__.py
-│   │   └── metrics.py
-│   │
-│   ├── visualization/
-│   │   ├── __init__.py
-│   │   └── gantt.py
-│   │
-│   └── utils/
-│       ├── __init__.py
-│       └── seed.py
-│
-├── scripts/
-│   └── run_baselines.py
-│
-└── tests/
-    ├── test_instance_generator.py
-    ├── test_env_feasibility.py
-    └── test_metrics.py
-```
+data/instances/fixed/train/
+data/instances/fixed/val/
+data/instances/fixed/test/
 
-If the current project already has another reasonable structure, prefer adapting to it instead of blindly replacing it. However, keep the modules logically separated.
+每个规模生成：
+
+small:
+train 200
+val 30
+test 50
+
+medium:
+train 200
+val 30
+test 50
+
+large:
+train 200
+val 30
+test 50
+
+每个实例至少包含：
+
+1. instance_id
+2. size
+3. seed
+4. jobs
+5. machines
+6. process_type
+7. release_time
+8. candidate_machines
+9. processing_time
+10. max_split_num
+11. rolling_period_length
+12. num_periods
+
+要求：
+
+1. 使用固定 random seed。
+2. 所有算法必须在同一批 test instances 上比较。
+3. 评估阶段不得临时重新生成实例。
+4. 生成逻辑优先复用 instance_generator.py。
 
 ---
 
-## 11. Required Modules for Prompt 1
+## 7. 统一评估要求
 
-### 11.1 `instance_generator.py`
+evaluate_methods.py 需要支持：
 
-Implement a reproducible instance generator supporting:
+python evaluate_methods.py --size small --split test
+python evaluate_methods.py --size medium --split test
+python evaluate_methods.py --size large --split test
 
-```python
-generate_instance(size="small", seed=42)
-```
+当前阶段至少评估以下方法：
 
-The generated instance should include:
+1. Random
+2. FIFO
+3. SPT
+4. LPT
+5. MinCandidateLoad
+6. GreedyECT
 
-- jobs;
-- machines;
-- process types;
-- release times;
-- candidate machine sets;
-- processing times;
-- maximum split number;
-- rolling period length;
-- number of periods.
+每个方法在固定 test instances 上运行，输出每个实例的结果，并生成 summary。
 
-Recommended scales:
+结果保存到：
 
-| size | jobs | machines | periods |
-|---|---:|---:|---:|
-| small | 20-30 | 5-8 | 3-5 |
-| medium | 50-80 | 8-12 | 5-8 |
-| large | 100-150 | 12-18 | 8-12 |
+data/results/stage_A/stage_A_baselines.csv
+data/results/stage_A/stage_A_summary.csv
 
-The generator must reflect non-identical parallel lines. Different machines of the same process type should have different speed factors.
+单实例 CSV 字段至少包括：
 
-### 11.2 `rolling_scheduling_env.py`
+1. method
+2. size
+3. split
+4. seed
+5. instance_id
+6. Cmax_roll
+7. average_completion_time
+8. average_waiting_time
+9. machine_utilization
+10. load_balance_std
+11. split_task_ratio
+12. total_split_count
+13. inference_time
+14. candidate_mode
+15. split_rule
+16. notes
 
-Implement a reinforcement-learning-compatible environment with at least:
-
-```python
-reset(instance=None)
-step(action)
-get_state()
-is_done()
-render_gantt()
-```
-
-The `step(action)` method should:
-
-1. validate the action;
-2. select machines;
-3. compute split ratios;
-4. schedule sub-tasks;
-5. update machine availability;
-6. update job completion;
-7. update active/unscheduled job sets;
-8. compute reward;
-9. return `(next_state, reward, done, info)`.
-
-### 11.3 `heuristics.py`
-
-Implement baseline dispatching rules:
-
-1. `Random`;
-2. `FIFO`;
-3. `SPT`;
-4. `LPT`;
-5. `MinCandidateLoad`;
-6. `GreedyECT`.
-
-All heuristics should use the same environment `step(action)` interface.
-
-### 11.4 `metrics.py`
-
-Implement metrics:
-
-- rolling makespan;
-- average completion time;
-- average waiting time;
-- machine utilization;
-- load balance standard deviation;
-- split task ratio;
-- total split count.
-
-### 11.5 `gantt.py`
-
-Implement Gantt-chart visualization:
-
-- x-axis: time;
-- y-axis: production lines;
-- each sub-task should show job id;
-- split sub-tasks of the same job should be recognizable;
-- save output as `.png`.
-
-### 11.6 `run_baselines.py`
-
-Implement a script that:
-
-1. generates small, medium, and large instances;
-2. runs all heuristic baselines;
-3. prints a metrics table;
-4. saves Gantt charts;
-5. ensures results are reproducible.
-
-The command should work:
-
-```bash
-python scripts/run_baselines.py
-```
+summary CSV 需要按 method 和 size 聚合 mean 和 std。
 
 ---
 
-## 12. Feasibility Requirements
+## 8. 阶段 A 一键运行
 
-The generated schedules must satisfy:
+run_stage_A.py 需要支持：
 
-1. A job is processed only on machines of its own process type.
+python run_stage_A.py --sizes small
+python run_stage_A.py --sizes small medium large
 
-2. A selected machine must belong to the job's candidate machine set.
+功能：
 
-3. Split ratios for a job must sum to 1.
+1. 检查 fixed dataset 是否存在。
+2. 若不存在，则自动生成。
+3. 调用 evaluate_methods.py 评估启发式。
+4. 保存 stage_A_baselines.csv。
+5. 保存 stage_A_summary.csv。
+6. 每个规模至少保存 1 张 FIFO 甘特图和 1 张 GreedyECT 甘特图。
 
-4. Split ratios must be positive for selected machines.
+结果目录：
 
-5. A job cannot start before its release time.
-
-6. A sub-task cannot start before the selected machine is available.
-
-7. No two sub-tasks overlap on the same machine.
-
-8. Once a sub-task starts, it is processed continuously.
-
-9. Job completion time equals the maximum completion time of its split sub-tasks.
-
-10. The final makespan equals the maximum completion time among all jobs.
-
-Write tests for at least the most important feasibility conditions.
+data/results/stage_A/
 
 ---
 
-## 13. Coding Style
+## 9. 拆分价值测试
 
-Use Python 3.10+.
+check_split_effect.py 用于判断当前问题中任务拆分是否真的能改善 Cmax。
 
-Use dataclasses or typed dictionaries for jobs, machines, and instances where appropriate.
+运行方式：
 
-Prefer readable, research-code-quality implementation over excessive abstraction.
+python check_split_effect.py --size small --split test
+python check_split_effect.py --size medium --split test
+python check_split_effect.py --size large --split test
 
-Use type hints for public functions.
+固定任务排序方式至少支持：
 
-Use deterministic seeding for reproducibility.
+1. FIFO ordering
+2. GreedyECT ordering
 
-Avoid hidden global state.
+在固定排序下测试以下拆分策略：
 
-Avoid hard-coded absolute paths.
+1. NoSplit：所有任务 split_num = 1。
+2. MaxSplit：所有任务使用最大可行拆分数。
+3. EqualSplit：多产线均分。
+4. SpeedRatioSplit：按加工速度反比分配。
+5. GreedyECTSplit：当前 GreedyECT 拆分规则。
+6. RandomSplit：随机拆分数量。
+7. OracleSplitDebug：枚举局部可行 split_num，选择当前局部 Cmax 最小的 split_num。
 
-Keep all generated outputs under `data/results/` or a similar results directory.
+输出文件：
 
-When a function has non-obvious scheduling logic, add concise comments.
+data/results/stage_A/split_effect_summary.csv
 
----
+注意：
 
-## 14. What Not to Do
-
-Do not model the problem as a multi-stage flow shop.
-
-Do not force every job through sl, cu, and co.
-
-Do not allow a job to be assigned to machines outside its process type.
-
-Do not ignore release times.
-
-Do not allow overlapping tasks on the same machine.
-
-Do not reschedule already-started cross-period sub-tasks.
-
-Do not implement deep reinforcement learning before the environment and baselines are validated.
-
-Do not over-engineer the first version with complex continuous-action policies.
-
-Do not use random behavior without exposing and controlling the random seed.
+OracleSplitDebug 只用于诊断拆分上限，不作为最终论文主方法。
 
 ---
 
-## 15. Expected Development Sequence
+## 10. 消融实验同步推进原则
 
-When implementing Prompt 1, follow this order:
+后续所有开发必须注意消融实验同步推进。
 
-1. Define data structures for jobs, machines, sub-tasks, schedules, and instances.
-2. Implement the instance generator.
-3. Implement environment reset and state initialization.
-4. Implement machine selection by ECT.
-5. Implement inverse-processing-time split ratios.
-6. Implement `step(action)`.
-7. Implement feasibility checks.
-8. Implement heuristic baselines.
-9. Implement metrics.
-10. Implement Gantt-chart output.
-11. Implement `run_baselines.py`.
-12. Add minimal tests.
+但不要额外增加无关消融。
 
-Only after this pipeline works should PPO or GNN-PPO be introduced.
+此前规划中的消融实验已经足够支撑论文完成，包括：
 
----
+1. 候选集消融。
+2. 学习方式消融。
+3. 图结构消融。
+4. 拆分策略消融。
+5. PPO 微调消融。
 
-## 16. Research Interpretation
+当前阶段 A 只需要推进：
 
-The first version of the code is not merely a demo. It is the foundation for later experimental comparison.
+拆分价值测试。
 
-The future paper will likely compare:
+这一步是后续拆分策略消融的基础。
 
-- heuristic rules;
-- plain PPO;
-- GNN-PPO;
-- possibly GNN-Hierarchical PPO.
-
-Therefore, the environment and baseline code must be reliable, reproducible, and extensible. If the environment is wrong, later PPO or GNN-PPO results will not be meaningful.
-
-The main research idea for the later second version is:
-
-> Use a graph neural network to encode the relationship between raw material batches and eligible non-identical production lines, then use PPO to learn a rolling scheduling policy.
-
-The initial simplified action `(job_id, split_num)` should make this later transition easier.
+不要在阶段 A 额外实现候选集消融、GNN 消融或 PPO 消融。
 
 ---
 
-## 17. Minimal Acceptance Criteria for Prompt 1
+## 11. 后续阶段方向，仅作为上下文
 
-Prompt 1 is considered successful only if:
+阶段 B：
+增强强启发式和候选集，包括 Lookahead Greedy、Beam Search、Hybrid TopK。
 
-1. `python scripts/run_baselines.py` runs successfully.
-2. Small, medium, and large instances are generated.
-3. All heuristic baselines return feasible schedules.
-4. A metrics table is printed.
-5. At least one Gantt chart is saved.
-6. No task overlaps occur on the same machine.
-7. All jobs are assigned only to eligible machines.
-8. Final makespan is correctly computed.
-9. The code structure allows PPO and GNN-PPO to be added later without rewriting the environment.
+阶段 C：
+实现 Multi-expert BC、MLP-Ranker、候选集排序学习。
 
-If any of these conditions fail, fix the environment before adding reinforcement learning.
+阶段 D：
+实现任务-产线二部图、GNN-Ranker、图结构消融。
+
+阶段 E：
+在 GNN-Ranker 基础上实现 Conservative PPO 微调，并进行 PPO 微调消融。
+
+当前只做阶段 A。
+
+---
+
+## 12. 代码质量要求
+
+1. 不要写成一次性 demo。
+2. 所有新增模块应便于后续扩展。
+3. 统一保存结果，避免散落到多个目录。
+4. 保证命令行参数清晰。
+5. 保证随机种子可控。
+6. 保证已有 baseline 可复现。
+7. 关键函数要有必要注释。
+8. 不要添加大量无意义注释。
+9. 不要引入过重依赖。
+10. 不要破坏已有项目结构。
+
+---
+
+## 13. 完成任务后需要汇报
+
+每次完成修改后，请说明：
+
+1. 新增了哪些文件。
+2. 修改了哪些原文件。
+3. 如何运行。
+4. 结果保存在哪里。
+5. 是否保持 run_baselines.py 兼容。
+6. 当前阶段对应哪个消融基础。
+7. 下一步建议是什么。
+
+---
+
+## 14. 编码要求
+
+本文件必须保存为 UTF-8 with BOM。
+
+如果在 Windows PowerShell 中重写本文件，建议使用：
+
+Set-Content -Path AGENTS.md -Value $content -Encoding utf8BOM
+
+如果使用 VS Code，请确认右下角编码显示为 UTF-8，并优先选择 Save with Encoding -> UTF-8 with BOM。
+
+不要保存为 ANSI、GBK 或 UTF-16。

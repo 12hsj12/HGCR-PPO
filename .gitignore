@@ -15,6 +15,11 @@ data/results/
 *.pkl
 !data/instances/
 !data/instances/*.pkl
+!data/instances/fixed/
+!data/instances/fixed/**/*.pkl
+!data/results/
+!data/results/stage_A/
+!data/results/stage_A/**
 *.pt
 *.pth
 .DS_Store
