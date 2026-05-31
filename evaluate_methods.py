@@ -10,6 +10,7 @@ from statistics import mean, pstdev
 from typing import Dict, Iterable, List
 
 from instance_manager import SIZES, SPLITS, ensure_fixed_dataset, load_fixed_instances
+from schedule_validator import VALIDATION_FIELDS, validate_schedule
 from src.baselines.heuristics import POLICIES, run_heuristic
 
 
@@ -43,6 +44,7 @@ ROW_FIELDS = [
     "candidate_mode",
     "split_rule",
     "notes",
+    *VALIDATION_FIELDS,
 ]
 
 
@@ -54,6 +56,7 @@ def evaluate_size_split(size: str, split: str, seed: int = 42) -> List[Dict]:
             start = time.perf_counter()
             result = run_heuristic(instance, method, seed=seed)
             inference_time = time.perf_counter() - start
+            validation = validate_schedule(result.env, instance)
             rows.append(
                 {
                     "method": method,
@@ -66,6 +69,7 @@ def evaluate_size_split(size: str, split: str, seed: int = 42) -> List[Dict]:
                     "candidate_mode": "all_eligible",
                     "split_rule": "env_inverse_processing_time",
                     "notes": "stage_A_fixed_instances",
+                    **validation,
                 }
             )
     return rows
@@ -92,12 +96,15 @@ def write_summary(rows: Iterable[Dict], output_path: Path = SUMMARY_CSV) -> List
             values = [float(row[metric]) for row in group]
             out[f"{metric}_mean"] = mean(values)
             out[f"{metric}_std"] = pstdev(values) if len(values) > 1 else 0.0
+        out["valid_ratio"] = mean(1.0 if row["is_valid_schedule"] else 0.0 for row in group)
+        out["cmax_check_pass_ratio"] = mean(1.0 if row["cmax_check_passed"] else 0.0 for row in group)
         summary_rows.append(out)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = ["method", "size", "split", "num_instances"]
     for metric in METRICS:
         fieldnames.extend([f"{metric}_mean", f"{metric}_std"])
+    fieldnames.extend(["valid_ratio", "cmax_check_pass_ratio"])
     with output_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()

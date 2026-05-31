@@ -35,9 +35,15 @@ def _candidate_load(env: RollingSchedulingEnv, job_id: str) -> float:
 
 def _greedy_completion(env: RollingSchedulingEnv, job_id: str) -> float:
     split_num = _choose_split_num(env, job_id)
-    trial = env.clone()
-    _, _, _, info = trial.step((job_id, split_num))
-    return info["job_completion_time"]
+    selected_machines = env._select_machines_by_ect(job_id, split_num)
+    ratios = env._compute_split_ratios(job_id, selected_machines)
+    job = env.job_by_id[job_id]
+    period_start = env._period_start(job.release_time)
+    return max(
+        max(env.machine_available_time[machine_id], job.release_time, period_start)
+        + ratios[machine_id] * env.instance.processing_time[job_id][machine_id]
+        for machine_id in selected_machines
+    )
 
 
 POLICIES: Dict[str, Callable[[RollingSchedulingEnv, random.Random], str]] = {
@@ -81,4 +87,3 @@ def run_heuristic(
 
 def run_all_heuristics(instance, seed: int = 42) -> List[HeuristicResult]:
     return [run_heuristic(instance, name, seed=seed) for name in POLICIES]
-
