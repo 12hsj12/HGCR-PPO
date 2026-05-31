@@ -190,7 +190,24 @@ def _episode_label(config: PPOConfig) -> str:
 
 def _experiment_tag(config: PPOConfig) -> str:
     bc_label = "bc" if config.bc_pretrain else "nobc"
-    return f"{config.policy_mode}_{config.split_rule}_{bc_label}_{config.size}_{_episode_label(config)}"
+    return (
+        f"{config.policy_mode}_{config.split_rule}_{bc_label}_{config.size}_"
+        f"{_episode_label(config)}_{_hparam_tag(config)}"
+    )
+
+
+def _format_hparam(value: float | int) -> str:
+    text = f"{value:g}"
+    text = text.replace("e-0", "e-").replace("e+0", "e")
+    return text
+
+
+def _hparam_tag(config: PPOConfig) -> str:
+    return (
+        f"lr{_format_hparam(config.learning_rate)}_"
+        f"clip{_format_hparam(config.clip_ratio)}_"
+        f"ue{config.update_epochs}"
+    )
 
 
 def _artifact_stem(config: PPOConfig) -> str:
@@ -198,7 +215,10 @@ def _artifact_stem(config: PPOConfig) -> str:
 
 
 def _bc_only_tag(config: PPOConfig) -> str:
-    return f"bc_only_{config.policy_mode}_{config.split_rule}_{config.size}_bc{config.bc_epochs}"
+    return (
+        f"bc_only_{config.policy_mode}_{config.split_rule}_{config.size}_"
+        f"bc{config.bc_epochs}_{_hparam_tag(config)}"
+    )
 
 
 def _legal_split_counts(wrapper: VectorSchedulingWrapper) -> Dict[int, int]:

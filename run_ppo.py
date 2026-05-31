@@ -38,6 +38,9 @@ def main() -> None:
     parser.add_argument("--regenerate_expert", action="store_true")
     parser.add_argument("--bc_only_eval", action="store_true")
     parser.add_argument("--freeze_bc_policy", action="store_true")
+    parser.add_argument("--learning_rate", type=float, default=PPOConfig.learning_rate)
+    parser.add_argument("--clip_ratio", type=float, default=PPOConfig.clip_ratio)
+    parser.add_argument("--update_epochs", type=int, default=PPOConfig.update_epochs)
     args = parser.parse_args()
     config = PPOConfig(
         size=args.size,
@@ -55,6 +58,19 @@ def main() -> None:
         regenerate_expert=args.regenerate_expert,
         bc_only_eval=args.bc_only_eval,
         freeze_bc_policy=args.freeze_bc_policy,
+        learning_rate=args.learning_rate,
+        clip_ratio=args.clip_ratio,
+        update_epochs=args.update_epochs,
+    )
+    print(
+        "PPO config: "
+        f"learning_rate={config.learning_rate}, "
+        f"clip_ratio={config.clip_ratio}, "
+        f"update_epochs={config.update_epochs}, "
+        f"policy_mode={config.policy_mode}, "
+        f"split_rule={config.split_rule}, "
+        f"bc_pretrain={config.bc_pretrain}, "
+        f"freeze_bc_policy={config.freeze_bc_policy}"
     )
     train_ppo, debug_ppo = _load_train_ppo()
     if args.debug:
