@@ -38,6 +38,8 @@ class PPOConfig:
     bc_epochs: int = 20
     expert_heuristic: str = "GreedyECT"
     regenerate_expert: bool = False
+    bc_only_eval: bool = False
+    freeze_bc_policy: bool = False
     reward_mode: str = "normalized_delta_plus_baseline_final"
     reward_scale: float = 1.0
     reward_clip: float = 1.0

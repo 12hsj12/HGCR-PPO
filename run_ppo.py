@@ -23,7 +23,7 @@ def _load_train_ppo():
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--size", choices=["small", "medium", "large"], required=True)
-    parser.add_argument("--episodes", type=int, required=True)
+    parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--eval_interval", type=int, default=10)
     parser.add_argument("--debug", action="store_true")
@@ -36,6 +36,8 @@ def main() -> None:
     parser.add_argument("--bc_epochs", type=int, default=20)
     parser.add_argument("--expert_heuristic", default="GreedyECT")
     parser.add_argument("--regenerate_expert", action="store_true")
+    parser.add_argument("--bc_only_eval", action="store_true")
+    parser.add_argument("--freeze_bc_policy", action="store_true")
     args = parser.parse_args()
     config = PPOConfig(
         size=args.size,
@@ -51,6 +53,8 @@ def main() -> None:
         bc_epochs=args.bc_epochs,
         expert_heuristic=args.expert_heuristic,
         regenerate_expert=args.regenerate_expert,
+        bc_only_eval=args.bc_only_eval,
+        freeze_bc_policy=args.freeze_bc_policy,
     )
     train_ppo, debug_ppo = _load_train_ppo()
     if args.debug:

@@ -197,6 +197,10 @@ def _artifact_stem(config: PPOConfig) -> str:
     return f"ppo_{_experiment_tag(config)}"
 
 
+def _bc_only_tag(config: PPOConfig) -> str:
+    return f"bc_only_{config.policy_mode}_{config.split_rule}_{config.size}_bc{config.bc_epochs}"
+
+
 def _legal_split_counts(wrapper: VectorSchedulingWrapper) -> Dict[int, int]:
     masks = wrapper.get_split_masks()
     counts = {}
@@ -285,6 +289,36 @@ def _step_with_policy_mode(wrapper: VectorSchedulingWrapper, config: PPOConfig, 
     return wrapper.step(int(action))
 
 
+def _run_bc_pretrain(agent: PPOAgent, train_instances, config: PPOConfig) -> Dict[str, float]:
+    expert_samples = _load_or_create_expert_samples(train_instances, config)
+    return agent.behavior_clone_job_head(expert_samples, epochs=config.bc_epochs)
+
+
+def _bc_only_eval(agent: PPOAgent, train_instances, test_instances, config: PPOConfig, bc_stats: Dict[str, float]) -> Dict[str, float]:
+    tag = _bc_only_tag(config)
+    final_eval = evaluate_agent(
+        agent,
+        test_instances,
+        config,
+        save_gantt_prefix=f"data/results/ppo/gantt/gantt_{tag}",
+    )
+    final_eval.update(
+        {
+            "bc_loss": bc_stats["bc_loss"],
+            "bc_accuracy": bc_stats["bc_accuracy"],
+            "bc_epochs": config.bc_epochs,
+            "expert_heuristic": config.expert_heuristic,
+        }
+    )
+    heuristic_rows = evaluate_heuristics_fixed(config.size)
+    eval_path = Path("data/results/ppo") / f"ppo_eval_{tag}.csv"
+    _write_eval(eval_path, final_eval, heuristic_rows)
+    create_comparison_plots(tag, "", final_eval, heuristic_rows)
+    agent.save(Path("data/models") / f"ppo_{tag}.pt")
+    print(f"saved BC-only eval: {eval_path}")
+    return final_eval
+
+
 def train_ppo(config: PPOConfig) -> Dict[str, float]:
     _ensure_dirs()
     _set_seed(config.seed)
@@ -308,9 +342,12 @@ def train_ppo(config: PPOConfig) -> Dict[str, float]:
     greedy_cmax = _reference_value(reference_rows, "GreedyECT") if reference_rows else float("nan")
     random_cmax = _reference_value(reference_rows, "Random") if reference_rows else float("nan")
     bc_stats = {"bc_loss": 0.0, "bc_accuracy": 0.0}
-    if config.bc_pretrain:
-        expert_samples = _load_or_create_expert_samples(train_instances, config)
-        bc_stats = agent.behavior_clone_job_head(expert_samples, epochs=config.bc_epochs)
+    if config.bc_pretrain or config.bc_only_eval:
+        bc_stats = _run_bc_pretrain(agent, train_instances, config)
+    if config.bc_only_eval:
+        return _bc_only_eval(agent, train_instances, test_instances, config, bc_stats)
+    if config.freeze_bc_policy:
+        agent.freeze_actor_policy()
 
     progress = tqdm(
         range(1, config.episodes + 1),

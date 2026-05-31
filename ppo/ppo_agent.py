@@ -179,6 +179,15 @@ class PPOAgent:
     def eval(self) -> None:
         self.model.eval()
 
+    def freeze_actor_policy(self) -> None:
+        """Freeze policy-producing modules and shared encoder for BC-policy diagnostics."""
+
+        for module in [self.model.shared, self.model.policy_head, self.model.job_head, self.model.split_head]:
+            for parameter in module.parameters():
+                parameter.requires_grad = False
+        for parameter in self.model.value_head.parameters():
+            parameter.requires_grad = True
+
     def action_debug_stats(self, obs: np.ndarray, masks, action) -> Dict[str, float]:
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
