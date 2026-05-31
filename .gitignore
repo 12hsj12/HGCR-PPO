@@ -1,27 +1,56 @@
+# Virtual environments
 .venv/
 venv/
+env/
+
+# Python cache and test cache
 __pycache__/
+**/__pycache__/
 *.pyc
+.pytest_cache/
+
+# IDE metadata
 .idea/
 .vscode/
-outputs/
+
+# Experiment results and temporary outputs
+data/results/*
+data/results_local/
+outputs/*
+runs/
+logs/*
+checkpoints/*
+wandb/
+tensorboard/
 results/
 figures/
-data/results/
+
+# Result artifacts and model checkpoints
+*.zip
 *.png
 *.jpg
+*.jpeg
 *.csv
 *.xlsx
+*.xls
+*.log
 *.pkl
+*.pt
+*.pth
+*.ckpt
+
+# Keep fixed benchmark instances versioned.
 !data/instances/
 !data/instances/*.pkl
 !data/instances/fixed/
 !data/instances/fixed/**/*.pkl
-!data/results/
-!data/results/stage_A/
-!data/results/stage_A/**
-!data/results/stage_B/
-!data/results/stage_B/**
-*.pt
-*.pth
+
+# Keep empty result/output directory structure versioned.
+!data/results/.gitkeep
+!outputs/.gitkeep
+!logs/.gitkeep
+!checkpoints/.gitkeep
+
+# System files
 .DS_Store
+Thumbs.db
