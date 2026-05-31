@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, List
+from typing import Callable, Dict, List
 
 from src.baselines.heuristics import (
     candidate_load,
@@ -41,6 +41,36 @@ def _ranked(env, key_fn: Callable[[str], tuple], top_k: int, allow_duplicate: bo
     return _dedupe(jobs[:top_k], allow_duplicate)
 
 
+def fifo_ranked(env) -> List[str]:
+    return sorted(env.get_schedulable_jobs(), key=lambda j: (env.job_by_id[j].release_time, j))
+
+
+def spt_ranked(env) -> List[str]:
+    return sorted(env.get_schedulable_jobs(), key=lambda j: (mean_candidate_processing_time(env, j), j))
+
+
+def greedy_ect_ranked(env) -> List[str]:
+    return sorted(env.get_schedulable_jobs(), key=lambda j: (estimated_completion_time(env, j), j))
+
+
+def minload_ranked(env) -> List[str]:
+    return sorted(env.get_schedulable_jobs(), key=lambda j: (candidate_load(env, j), env.job_by_id[j].release_time, j))
+
+
+def lookahead_ranked(env) -> List[str]:
+    return sorted(env.get_schedulable_jobs(), key=lambda j: (lookahead_score(env, j), j))
+
+
+def first_rule_jobs(env) -> Dict[str, str | None]:
+    rankings = {
+        "fifo": fifo_ranked(env),
+        "greedy": greedy_ect_ranked(env),
+        "lookahead": lookahead_ranked(env),
+        "minload": minload_ranked(env),
+    }
+    return {name: (jobs[0] if jobs else None) for name, jobs in rankings.items()}
+
+
 def _fifo(env, top_k: int, allow_duplicate: bool) -> List[str]:
     return _ranked(env, lambda j: (env.job_by_id[j].release_time, j), top_k, allow_duplicate)
 
@@ -62,7 +92,14 @@ def _lookahead(env, top_k: int, allow_duplicate: bool) -> List[str]:
 
 
 def _hybrid(env, top_k: int, allow_duplicate: bool) -> List[str]:
-    merged: List[str] = []
+    forced = [
+        first
+        for first in first_rule_jobs(env).values()
+        if first is not None
+    ]
+    forced = _dedupe(forced, allow_duplicate=False)
+
+    merged: List[str] = list(forced)
     for bucket in [
         _fifo(env, top_k, allow_duplicate=True),
         _spt(env, top_k, allow_duplicate=True),
@@ -73,7 +110,11 @@ def _hybrid(env, top_k: int, allow_duplicate: bool) -> List[str]:
         merged.extend(bucket)
     merged = _dedupe(merged, allow_duplicate)
     if len(merged) > top_k:
-        merged = sorted(merged, key=lambda j: (lookahead_score(env, j), estimated_completion_time(env, j), j))[:top_k]
+        forced_set = set(forced)
+        extras = [job_id for job_id in merged if job_id not in forced_set]
+        slots = max(0, top_k - len(forced))
+        extras = sorted(extras, key=lambda j: (lookahead_score(env, j), estimated_completion_time(env, j), j))[:slots]
+        merged = forced + extras
     return merged
 
 
@@ -109,4 +150,3 @@ def generate_candidates(
     if not candidates and fallback_to_all:
         return list(all_jobs)
     return candidates
-
