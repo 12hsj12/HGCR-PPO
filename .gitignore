@@ -20,6 +20,8 @@ data/results/
 !data/results/
 !data/results/stage_A/
 !data/results/stage_A/**
+!data/results/stage_B/
+!data/results/stage_B/**
 *.pt
 *.pth
 .DS_Store
