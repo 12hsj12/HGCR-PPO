@@ -10,11 +10,8 @@ from pathlib import Path
 from statistics import mean, pstdev
 from typing import Dict, Iterable, List
 
-import torch
-
 from candidate_generator import fifo_ranked
 from instance_manager import SIZES, SPLITS, ensure_fixed_dataset, load_fixed_instances
-from mlp_models import load_checkpoint
 from schedule_validator import VALIDATION_FIELDS, validate_schedule
 from src.baselines.heuristics import choose_split_num
 from src.envs.rolling_scheduling_env import RollingSchedulingEnv
@@ -29,10 +26,10 @@ from stage_c_utils import (
 from utils.experiment_io import (
     make_result_path,
     make_run_id,
-    rebuild_all_summary,
     sanitize_token,
     save_csv_no_overwrite,
     update_latest_file,
+    write_csv,
 )
 
 
@@ -67,6 +64,7 @@ ROW_FIELDS = [
     "split",
     "top_k",
     "model_tag",
+    "run_id",
     "instance_id",
     *METRICS,
     *VALIDATION_FIELDS,
@@ -74,6 +72,8 @@ ROW_FIELDS = [
 
 
 def _model_select(model, env, candidates: List[str]) -> str:
+    import torch
+
     features = torch.tensor([extract_candidate_features(env, candidates)], dtype=torch.float32)
     with torch.no_grad():
         scores = model(features)[0]
@@ -156,6 +156,7 @@ def evaluate_ranker(
     split: str,
     top_k: int,
     model_tag: str,
+    run_id: str,
     bc_model_path: str | None,
     ranker_model_path: str | None,
     methods: List[str],
@@ -181,6 +182,7 @@ def evaluate_ranker(
                     "split": split,
                     "top_k": top_k,
                     "model_tag": model_tag,
+                    "run_id": run_id,
                     "instance_id": getattr(instance, "instance_id", instance.name),
                     **metrics,
                 }
@@ -195,6 +197,8 @@ def _load_models_for_methods(
     size: str,
     top_k: int,
 ) -> Dict[str, object]:
+    from mlp_models import load_checkpoint
+
     models: Dict[str, object] = {}
     if "mlp_bc" in methods:
         if not bc_model_path:
@@ -257,7 +261,7 @@ def write_summary(rows: Iterable[Dict], path: Path) -> None:
 
 
 def summary_fields() -> List[str]:
-    fieldnames = ["method", "size", "split", "top_k", "model_tag", "num_instances"]
+    fieldnames = ["method", "size", "split", "top_k", "model_tag", "run_id", "num_instances"]
     for metric in METRICS:
         fieldnames.extend([f"{metric}_mean", f"{metric}_std"])
     fieldnames.extend(["valid_ratio", "cmax_check_pass_ratio"])
@@ -294,11 +298,19 @@ def update_latest_and_all(rows: List[Dict]) -> None:
     update_latest_file(rows, latest_detail_path, ROW_FIELDS)
     summary_rows = summarize_rows(rows)
     update_latest_file(summary_rows, latest_summary_path, summary_fields())
-    rebuild_all_summary(
-        result_dir=RESULT_DIR,
+    rebuild_ranker_all_outputs()
+    print(f"Updated latest files: {latest_detail_path}, {latest_summary_path}")
+    print(f"Updated all files: {RESULT_DIR / 'ranker_eval_all.csv'}, {RESULT_DIR / 'ranker_eval_summary_all.csv'}")
+
+
+def rebuild_ranker_all_outputs() -> tuple[Path, Path]:
+    detail_path = RESULT_DIR / "ranker_eval_all.csv"
+    summary_path = RESULT_DIR / "ranker_eval_summary_all.csv"
+    detail_rows = collect_ranker_csv_rows(
         pattern="ranker_eval_*_topk*.csv",
-        output_path=RESULT_DIR / "ranker_eval_all.csv",
-        fieldnames=ROW_FIELDS,
+        output_fields=ROW_FIELDS,
+        legacy_fields=[field for field in ROW_FIELDS if field != "run_id"],
+        filename_prefix="ranker_eval",
         exclude_names={
             "ranker_eval.csv",
             "ranker_eval_latest.csv",
@@ -308,38 +320,106 @@ def update_latest_and_all(rows: List[Dict]) -> None:
             "ranker_eval_summary_all.csv",
         },
         exclude_prefixes=("ranker_eval_summary_",),
-        required_substrings=("_runid",),
     )
-    rebuild_all_summary(
-        result_dir=RESULT_DIR,
+    summary_rows = collect_ranker_csv_rows(
         pattern="ranker_eval_summary_*_topk*.csv",
-        output_path=RESULT_DIR / "ranker_eval_summary_all.csv",
-        fieldnames=summary_fields(),
+        output_fields=summary_fields(),
+        legacy_fields=[field for field in summary_fields() if field != "run_id"],
+        filename_prefix="ranker_eval_summary",
         exclude_names={
             "ranker_eval_summary.csv",
             "ranker_eval_summary_latest.csv",
             "ranker_eval_summary_all.csv",
         },
-        required_substrings=("_runid",),
     )
-    print(f"Updated latest files: {latest_detail_path}, {latest_summary_path}")
-    print(f"Updated all files: {RESULT_DIR / 'ranker_eval_all.csv'}, {RESULT_DIR / 'ranker_eval_summary_all.csv'}")
+    write_csv(detail_rows, detail_path, ROW_FIELDS)
+    write_csv(summary_rows, summary_path, summary_fields())
+    return detail_path, summary_path
+
+
+def collect_ranker_csv_rows(
+    pattern: str,
+    output_fields: List[str],
+    legacy_fields: List[str],
+    filename_prefix: str,
+    exclude_names: set[str],
+    exclude_prefixes: tuple[str, ...] = (),
+) -> List[Dict]:
+    rows: List[Dict] = []
+    for path in sorted(RESULT_DIR.glob(pattern)):
+        if path.name in exclude_names or any(path.name.startswith(prefix) for prefix in exclude_prefixes):
+            continue
+        if path.suffix.lower() != ".csv":
+            continue
+        metadata = parse_ranker_result_filename(path.name, filename_prefix)
+        if metadata is None:
+            print(f"Warning: skipped {path} because filename does not match the Stage C ranker schema.")
+            continue
+        with path.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames == output_fields:
+                has_run_id = True
+            elif reader.fieldnames == legacy_fields:
+                has_run_id = False
+            else:
+                print(
+                    f"Warning: skipped {path} because CSV fields do not match the current or legacy Stage C schema."
+                )
+                continue
+            for row in reader:
+                normalized = {field: row.get(field, "") for field in output_fields}
+                normalized["size"] = normalized.get("size") or metadata["size"]
+                normalized["split"] = normalized.get("split") or metadata["split"]
+                normalized["top_k"] = normalized.get("top_k") or metadata["top_k"]
+                normalized["model_tag"] = normalized.get("model_tag") or metadata["model_tag"]
+                if not has_run_id or not normalized.get("run_id"):
+                    normalized["run_id"] = metadata["run_id"]
+                rows.append(normalized)
+    return rows
+
+
+def parse_ranker_result_filename(filename: str, prefix: str) -> Dict[str, str] | None:
+    stem = Path(filename).stem
+    marker = f"{prefix}_"
+    if not stem.startswith(marker):
+        return None
+    tail = stem[len(marker) :]
+    parts = tail.split("_", 3)
+    if len(parts) < 4:
+        return None
+    size, split, topk_token, tag_and_run = parts
+    if size not in SIZES or split not in SPLITS or not topk_token.startswith("topk"):
+        return None
+    top_k = topk_token[4:]
+    if not top_k.isdigit():
+        return None
+    if "_runid" in tag_and_run:
+        model_tag, run_id = tag_and_run.rsplit("_runid", 1)
+        run_id = run_id or "manual"
+    else:
+        model_tag = tag_and_run
+        run_id = "legacy"
+    return {"size": size, "split": split, "top_k": top_k, "model_tag": model_tag or "manual", "run_id": run_id}
 
 
 def summarize_rows(rows: Iterable[Dict]) -> List[Dict]:
     rows = list(rows)
-    grouped: Dict[tuple[str, str, str, int, str], List[Dict]] = {}
+    grouped: Dict[tuple[str, str, str, int, str, str], List[Dict]] = {}
     for row in rows:
-        grouped.setdefault((row["method"], row["size"], row["split"], int(row["top_k"]), row["model_tag"]), []).append(row)
+        grouped.setdefault(
+            (row["method"], row["size"], row["split"], int(row["top_k"]), row["model_tag"], row["run_id"]),
+            [],
+        ).append(row)
 
     summary_rows = []
-    for (method, size, split, top_k, model_tag), group in sorted(grouped.items()):
+    for (method, size, split, top_k, model_tag, run_id), group in sorted(grouped.items()):
         out = {
             "method": method,
             "size": size,
             "split": split,
             "top_k": top_k,
             "model_tag": model_tag,
+            "run_id": run_id,
             "num_instances": len(group),
         }
         for metric in METRICS:
@@ -360,7 +440,8 @@ def _truthy(value) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--size", choices=SIZES, required=True)
+    parser.add_argument("--rebuild_all", action="store_true")
+    parser.add_argument("--size", choices=SIZES, default=None)
     parser.add_argument("--split", choices=SPLITS, default="test")
     parser.add_argument("--top_k", type=int, default=5)
     parser.add_argument("--model_tag", default=None)
@@ -373,6 +454,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--oracle_rollout_policy", choices=["fifo", "lookahead"], default="fifo")
     args = parser.parse_args()
+    if args.rebuild_all:
+        detail_path, summary_path = rebuild_ranker_all_outputs()
+        print(f"Rebuilt all files: {detail_path}, {summary_path}")
+        return
+    if args.size is None:
+        parser.error("--size is required unless --rebuild_all is used.")
     run_id = make_run_id(args.run_id)
     model_tag = infer_model_tag(args.methods, args.bc_model_path, args.ranker_model_path, args.model_tag)
 
@@ -382,6 +469,7 @@ def main() -> None:
             split=args.split,
             top_k=args.top_k,
             model_tag=model_tag,
+            run_id=run_id,
             bc_model_path=args.bc_model_path,
             ranker_model_path=args.ranker_model_path,
             methods=args.methods,
