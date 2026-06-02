@@ -19,6 +19,7 @@ from stage_c_utils import (
     oracle_cmax_per_candidate,
     save_ranker_records,
 )
+from utils.experiment_io import progress_iter
 
 
 def generate_records_for_instance(instance, top_k: int, oracle_rollout_policy: str = "fifo") -> List[Dict]:
@@ -76,7 +77,8 @@ def generate_dataset(
 
     records: List[Dict] = []
     started = time.perf_counter()
-    for idx, instance in enumerate(instances, start=1):
+    desc = f"ranker-data {size}/{split} topk{top_k}"
+    for idx, instance in enumerate(progress_iter(instances, desc=desc, total=len(instances)), start=1):
         instance_records = generate_records_for_instance(instance, top_k, oracle_rollout_policy)
         records.extend(instance_records)
         print(

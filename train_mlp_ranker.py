@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 from instance_manager import SIZES
 from mlp_models import CandidateScorer, save_checkpoint
 from stage_c_utils import dataset_path, load_ranker_records
-from utils.experiment_io import make_result_path, make_run_dir, make_run_id, update_latest_dir
+from utils.experiment_io import make_result_path, make_run_dir, make_run_id, update_latest_dir, progress_iter
 
 
 class RankerRecordDataset(Dataset):
@@ -140,7 +140,8 @@ def train(
     with log_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_loss", "val_top1_acc"])
         writer.writeheader()
-        for epoch in range(1, epochs + 1):
+        desc = f"train-mlp-ranker {size} topk{top_k} {loss_type}"
+        for epoch in progress_iter(range(1, epochs + 1), desc=desc, total=epochs):
             model.train()
             train_losses = []
             for batch in train_loader:

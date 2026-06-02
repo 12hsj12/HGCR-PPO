@@ -119,3 +119,11 @@ def rebuild_all_summary(
             combined_rows.extend(reader)
 
     return write_csv(combined_rows, output_path, expected_fields)
+
+
+def progress_iter(iterable, **kwargs):
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        return iterable
+    return tqdm(iterable, **kwargs)

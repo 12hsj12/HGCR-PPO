@@ -20,7 +20,7 @@ from schedule_validator import VALIDATION_FIELDS, validate_schedule
 from src.baselines.heuristics import choose_split_num, estimated_completion_time, lookahead_score
 from src.envs.rolling_scheduling_env import RollingSchedulingEnv
 from src.evaluation.metrics import compute_metrics
-from utils.experiment_io import make_result_path, make_run_id, rebuild_all_summary, update_latest_file
+from utils.experiment_io import make_result_path, make_run_id, rebuild_all_summary, update_latest_file, progress_iter
 
 
 RESULT_DIR = Path("data/results/stage_B")
@@ -214,8 +214,9 @@ def evaluate_candidate_ablation(
         instances = instances[: max(0, max_instances)]
 
     rows: List[Dict] = []
-    for instance in instances:
-        for method in METHODS:
+    for method in METHODS:
+        desc = f"stage-B {size}/{split} topk{top_k} {method}"
+        for instance in progress_iter(instances, desc=desc, total=len(instances)):
             metrics = run_candidate_method(
                 instance,
                 method,

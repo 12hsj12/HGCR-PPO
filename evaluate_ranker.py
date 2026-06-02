@@ -29,6 +29,7 @@ from utils.experiment_io import (
     sanitize_token,
     save_csv_no_overwrite,
     update_latest_file,
+    progress_iter,
     write_csv,
 )
 
@@ -39,6 +40,7 @@ METHODS = [
     "hybrid_topk_fifo_select",
     "mlp_bc",
     "mlp_ranker",
+    "mlp_ranker_safe",
     "oracle_debug",
 ]
 DEFAULT_RULE_METHODS = [
@@ -57,6 +59,20 @@ METRICS = [
     "inference_time",
     "action_match_oracle_ratio",
     "action_match_fifo_ratio",
+    "safe_fallback_count",
+    "safe_ranker_override_count",
+    "safe_fallback_ratio",
+    "safe_ranker_override_ratio",
+    "ranker_margin_mean",
+    "ranker_margin_std",
+]
+SAFE_METRICS = [
+    "safe_fallback_count",
+    "safe_ranker_override_count",
+    "safe_fallback_ratio",
+    "safe_ranker_override_ratio",
+    "ranker_margin_mean",
+    "ranker_margin_std",
 ]
 ROW_FIELDS = [
     "method",
@@ -72,12 +88,44 @@ ROW_FIELDS = [
 
 
 def _model_select(model, env, candidates: List[str]) -> str:
+    scores = _model_scores(model, env, candidates)
+    return candidates[int(max(range(len(scores)), key=lambda idx: scores[idx]))]
+
+
+def _model_scores(model, env, candidates: List[str]) -> List[float]:
     import torch
 
     features = torch.tensor([extract_candidate_features(env, candidates)], dtype=torch.float32)
     with torch.no_grad():
         scores = model(features)[0]
-    return candidates[int(scores.argmax().item())]
+    return [float(score) for score in scores.tolist()]
+
+
+def _fifo_candidate(env, candidates: List[str]) -> str:
+    fifo_order = {job_id: idx for idx, job_id in enumerate(fifo_ranked(env))}
+    return min(candidates, key=lambda j: (fifo_order.get(j, 10**9), j))
+
+
+def _ranker_safe_select(
+    model,
+    env,
+    candidates: List[str],
+    ranker_margin_threshold: float,
+) -> tuple[str, Dict[str, float]]:
+    if model is None:
+        raise ValueError(
+            "mlp_ranker_safe requires --ranker_model_path. Please train MLP-Ranker first or remove "
+            "mlp_ranker_safe from --methods."
+        )
+    scores = _model_scores(model, env, candidates)
+    score_by_job = {job_id: scores[idx] for idx, job_id in enumerate(candidates)}
+    fifo_job = _fifo_candidate(env, candidates)
+    ranker_job = candidates[int(max(range(len(scores)), key=lambda idx: scores[idx]))]
+    margin = float(score_by_job[ranker_job] - score_by_job[fifo_job])
+
+    if ranker_job == fifo_job or margin < ranker_margin_threshold:
+        return fifo_job, {"fallback": 1.0, "override": 0.0, "margin": margin}
+    return ranker_job, {"fallback": 0.0, "override": 1.0, "margin": margin}
 
 
 def _select_job(
@@ -92,16 +140,15 @@ def _select_job(
     if method == "hybrid_topk_random":
         return rng.choice(candidates)
     if method == "hybrid_topk_fifo_select":
-        fifo_order = {job_id: idx for idx, job_id in enumerate(fifo_ranked(env))}
-        return min(candidates, key=lambda j: (fifo_order.get(j, 10**9), j))
-    if method in {"mlp_bc", "mlp_ranker"}:
+        return _fifo_candidate(env, candidates)
+    if method in {"mlp_bc", "mlp_ranker", "mlp_ranker_safe"}:
         if model is None:
             if method == "mlp_bc":
                 raise ValueError(
                     "mlp_bc requires --bc_model_path. Please train MLP-BC first or remove mlp_bc from --methods."
                 )
             raise ValueError(
-                "mlp_ranker requires --ranker_model_path. Please train MLP-Ranker first or remove mlp_ranker from --methods."
+                f"{method} requires --ranker_model_path. Please train MLP-Ranker first or remove {method} from --methods."
             )
         return _model_select(model, env, candidates)
     if method == "oracle_debug":
@@ -116,6 +163,7 @@ def run_method(
     top_k: int,
     seed: int,
     oracle_rollout_policy: str,
+    ranker_margin_threshold: float,
     model=None,
 ) -> Dict:
     rng = random.Random(seed)
@@ -123,6 +171,9 @@ def run_method(
     env.reset(instance)
     oracle_matches = []
     fifo_matches = []
+    safe_fallbacks = []
+    safe_overrides = []
+    ranker_margins = []
     start = time.perf_counter()
 
     while not env.is_done():
@@ -130,15 +181,21 @@ def run_method(
         oracle_cmax = oracle_cmax_per_candidate(env, candidates, rollout_policy=oracle_rollout_policy)
         oracle_job = candidates[best_candidate_index(oracle_cmax)]
         fifo_job = fifo_first(env)
-        job_id = _select_job(
-            method,
-            env,
-            candidates,
-            rng,
-            oracle_rollout_policy=oracle_rollout_policy,
-            model=model,
-            oracle_cmax=oracle_cmax,
-        )
+        if method == "mlp_ranker_safe":
+            job_id, safe_diag = _ranker_safe_select(model, env, candidates, ranker_margin_threshold)
+            safe_fallbacks.append(safe_diag["fallback"])
+            safe_overrides.append(safe_diag["override"])
+            ranker_margins.append(safe_diag["margin"])
+        else:
+            job_id = _select_job(
+                method,
+                env,
+                candidates,
+                rng,
+                oracle_rollout_policy=oracle_rollout_policy,
+                model=model,
+                oracle_cmax=oracle_cmax,
+            )
         oracle_matches.append(1.0 if job_id == oracle_job else 0.0)
         fifo_matches.append(1.0 if fifo_job is not None and job_id == fifo_job else 0.0)
         env.step((job_id, choose_split_num(env, job_id)))
@@ -147,6 +204,12 @@ def run_method(
     metrics["inference_time"] = time.perf_counter() - start
     metrics["action_match_oracle_ratio"] = mean(oracle_matches) if oracle_matches else 0.0
     metrics["action_match_fifo_ratio"] = mean(fifo_matches) if fifo_matches else 0.0
+    metrics["safe_fallback_count"] = sum(safe_fallbacks)
+    metrics["safe_ranker_override_count"] = sum(safe_overrides)
+    metrics["safe_fallback_ratio"] = mean(safe_fallbacks) if safe_fallbacks else 0.0
+    metrics["safe_ranker_override_ratio"] = mean(safe_overrides) if safe_overrides else 0.0
+    metrics["ranker_margin_mean"] = mean(ranker_margins) if ranker_margins else 0.0
+    metrics["ranker_margin_std"] = pstdev(ranker_margins) if len(ranker_margins) > 1 else 0.0
     metrics.update(validate_schedule(env, instance))
     return metrics
 
@@ -163,6 +226,7 @@ def evaluate_ranker(
     max_instances: int | None,
     seed: int,
     oracle_rollout_policy: str,
+    ranker_margin_threshold: float,
 ) -> List[Dict]:
     ensure_fixed_dataset([size], [split])
     instances = load_fixed_instances(size, split)
@@ -171,10 +235,19 @@ def evaluate_ranker(
 
     models = _load_models_for_methods(methods, bc_model_path, ranker_model_path, size, top_k)
     rows: List[Dict] = []
-    for instance in instances:
-        for method in methods:
+    for method in methods:
+        desc = f"eval {size}/{split} topk{top_k} {method}"
+        for instance in progress_iter(instances, desc=desc, total=len(instances)):
             model = models.get(method)
-            metrics = run_method(instance, method, top_k, seed, oracle_rollout_policy, model=model)
+            metrics = run_method(
+                instance,
+                method,
+                top_k,
+                seed,
+                oracle_rollout_policy,
+                ranker_margin_threshold=ranker_margin_threshold,
+                model=model,
+            )
             rows.append(
                 {
                     "method": method,
@@ -209,15 +282,18 @@ def _load_models_for_methods(
         if not bc_path.exists():
             raise FileNotFoundError(_missing_bc_checkpoint_message(bc_path, size, top_k))
         models["mlp_bc"] = load_checkpoint(bc_path)
-    if "mlp_ranker" in methods:
+    if "mlp_ranker" in methods or "mlp_ranker_safe" in methods:
         if not ranker_model_path:
             raise ValueError(
-                "mlp_ranker requires --ranker_model_path. Please train MLP-Ranker first or remove mlp_ranker from --methods."
+                "mlp_ranker and mlp_ranker_safe require --ranker_model_path. Please train MLP-Ranker first "
+                "or remove ranker methods from --methods."
             )
         ranker_path = Path(ranker_model_path)
         if not ranker_path.exists():
             raise FileNotFoundError(_missing_ranker_checkpoint_message(ranker_path, size, top_k))
-        models["mlp_ranker"] = load_checkpoint(ranker_path)
+        ranker_model = load_checkpoint(ranker_path)
+        models["mlp_ranker"] = ranker_model
+        models["mlp_ranker_safe"] = ranker_model
     return models
 
 
@@ -279,7 +355,7 @@ def result_paths(size: str, split: str, top_k: int, model_tag: str, run_id: str,
 def infer_model_tag(methods: List[str], bc_model_path: str | None, ranker_model_path: str | None, model_tag: str | None) -> str:
     if model_tag:
         return sanitize_token(model_tag)
-    model_methods = {"mlp_bc", "mlp_ranker"}
+    model_methods = {"mlp_bc", "mlp_ranker", "mlp_ranker_safe"}
     if not any(method in model_methods for method in methods):
         return "rules_only"
     ranker_path = str(ranker_model_path or "").lower()
@@ -300,16 +376,22 @@ def update_latest_and_all(rows: List[Dict]) -> None:
     update_latest_file(summary_rows, latest_summary_path, summary_fields())
     rebuild_ranker_all_outputs()
     print(f"Updated latest files: {latest_detail_path}, {latest_summary_path}")
-    print(f"Updated all files: {RESULT_DIR / 'ranker_eval_all.csv'}, {RESULT_DIR / 'ranker_eval_summary_all.csv'}")
+    print(
+        "Updated all files: "
+        f"{RESULT_DIR / 'ranker_eval_all.csv'}, "
+        f"{RESULT_DIR / 'ranker_eval_summary_all.csv'}, "
+        f"{RESULT_DIR / 'ranker_eval_summary_clean.csv'}"
+    )
 
 
 def rebuild_ranker_all_outputs() -> tuple[Path, Path]:
     detail_path = RESULT_DIR / "ranker_eval_all.csv"
     summary_path = RESULT_DIR / "ranker_eval_summary_all.csv"
+    clean_summary_path = RESULT_DIR / "ranker_eval_summary_clean.csv"
     detail_rows = collect_ranker_csv_rows(
         pattern="ranker_eval_*_topk*.csv",
         output_fields=ROW_FIELDS,
-        legacy_fields=[field for field in ROW_FIELDS if field != "run_id"],
+        required_fields=["method", "size", "split", "top_k", "instance_id"],
         filename_prefix="ranker_eval",
         exclude_names={
             "ranker_eval.csv",
@@ -324,7 +406,7 @@ def rebuild_ranker_all_outputs() -> tuple[Path, Path]:
     summary_rows = collect_ranker_csv_rows(
         pattern="ranker_eval_summary_*_topk*.csv",
         output_fields=summary_fields(),
-        legacy_fields=[field for field in summary_fields() if field != "run_id"],
+        required_fields=["method", "size", "split", "top_k", "num_instances"],
         filename_prefix="ranker_eval_summary",
         exclude_names={
             "ranker_eval_summary.csv",
@@ -334,13 +416,29 @@ def rebuild_ranker_all_outputs() -> tuple[Path, Path]:
     )
     write_csv(detail_rows, detail_path, ROW_FIELDS)
     write_csv(summary_rows, summary_path, summary_fields())
+    write_csv(clean_summary_rows(summary_rows), clean_summary_path, summary_fields())
     return detail_path, summary_path
+
+
+def clean_summary_rows(rows: Iterable[Dict]) -> List[Dict]:
+    chosen: Dict[tuple[str, str, str, str, str], Dict] = {}
+    for row in rows:
+        key = (row["size"], row["split"], str(row["top_k"]), row["model_tag"], row["method"])
+        current = chosen.get(key)
+        if current is None or _summary_row_rank(row) >= _summary_row_rank(current):
+            chosen[key] = row
+    return [chosen[key] for key in sorted(chosen)]
+
+
+def _summary_row_rank(row: Dict) -> tuple[int, str]:
+    run_id = str(row.get("run_id") or "legacy")
+    return (0 if run_id == "legacy" else 1, run_id)
 
 
 def collect_ranker_csv_rows(
     pattern: str,
     output_fields: List[str],
-    legacy_fields: List[str],
+    required_fields: List[str],
     filename_prefix: str,
     exclude_names: set[str],
     exclude_prefixes: tuple[str, ...] = (),
@@ -357,15 +455,13 @@ def collect_ranker_csv_rows(
             continue
         with path.open("r", newline="") as f:
             reader = csv.DictReader(f)
-            if reader.fieldnames == output_fields:
-                has_run_id = True
-            elif reader.fieldnames == legacy_fields:
-                has_run_id = False
-            else:
+            fieldnames = reader.fieldnames or []
+            if not _compatible_ranker_fields(fieldnames, output_fields, required_fields):
                 print(
-                    f"Warning: skipped {path} because CSV fields do not match the current or legacy Stage C schema."
+                    f"Warning: skipped {path} because CSV fields do not contain the required Stage C schema fields."
                 )
                 continue
+            has_run_id = "run_id" in fieldnames
             for row in reader:
                 normalized = {field: row.get(field, "") for field in output_fields}
                 normalized["size"] = normalized.get("size") or metadata["size"]
@@ -376,6 +472,12 @@ def collect_ranker_csv_rows(
                     normalized["run_id"] = metadata["run_id"]
                 rows.append(normalized)
     return rows
+
+
+def _compatible_ranker_fields(fieldnames: List[str], output_fields: List[str], required_fields: List[str]) -> bool:
+    field_set = set(fieldnames)
+    output_set = set(output_fields)
+    return set(required_fields).issubset(field_set) and field_set.issubset(output_set)
 
 
 def parse_ranker_result_filename(filename: str, prefix: str) -> Dict[str, str] | None:
@@ -453,10 +555,11 @@ def main() -> None:
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--oracle_rollout_policy", choices=["fifo", "lookahead"], default="fifo")
+    parser.add_argument("--ranker_margin_threshold", type=float, default=0.0)
     args = parser.parse_args()
     if args.rebuild_all:
         detail_path, summary_path = rebuild_ranker_all_outputs()
-        print(f"Rebuilt all files: {detail_path}, {summary_path}")
+        print(f"Rebuilt all files: {detail_path}, {summary_path}, {RESULT_DIR / 'ranker_eval_summary_clean.csv'}")
         return
     if args.size is None:
         parser.error("--size is required unless --rebuild_all is used.")
@@ -476,6 +579,7 @@ def main() -> None:
             max_instances=args.max_instances,
             seed=args.seed,
             oracle_rollout_policy=args.oracle_rollout_policy,
+            ranker_margin_threshold=args.ranker_margin_threshold,
         )
     except (ValueError, FileNotFoundError) as exc:
         raise SystemExit(str(exc)) from exc
