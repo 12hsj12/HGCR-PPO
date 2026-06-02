@@ -27,6 +27,7 @@ def generate_records_for_instance(instance, top_k: int, oracle_rollout_policy: s
     env.reset(instance)
     records: List[Dict] = []
     step_id = 0
+    rollout_job_history: List[str] = []
 
     while not env.is_done():
         candidates = hybrid_candidates(env, top_k)
@@ -45,6 +46,7 @@ def generate_records_for_instance(instance, top_k: int, oracle_rollout_policy: s
                 "step_id": step_id,
                 "current_time": current_time(env),
                 "current_period": int(current_time(env) // instance.rolling_period_length),
+                "rollout_job_history": list(rollout_job_history),
                 "candidate_job_ids": list(candidates),
                 "candidate_features": features,
                 "candidate_scores": [-float(value) for value in cmax_values],
@@ -57,6 +59,7 @@ def generate_records_for_instance(instance, top_k: int, oracle_rollout_policy: s
             }
         )
         env.step((best_job, choose_split_num(env, best_job)))
+        rollout_job_history.append(best_job)
         step_id += 1
 
     return records
