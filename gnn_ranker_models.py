@@ -9,6 +9,9 @@ import torch
 from torch import nn
 
 
+GNN_VARIANTS = ["gnn_v1", "gnn_v2_edge_fusion", "gnn_v2_no_fusion", "gnn_residual"]
+
+
 class BipartiteGNNRanker(nn.Module):
     """Scores candidate jobs with edge-aware message passing and optional feature fusion."""
 
@@ -22,8 +25,12 @@ class BipartiteGNNRanker(nn.Module):
         dropout: float = 0.1,
         candidate_feature_dim: int = 0,
         use_candidate_feature_fusion: bool = True,
+        gnn_variant: str = "gnn_v2_edge_fusion",
+        residual_alpha: float = 0.5,
     ):
         super().__init__()
+        if gnn_variant not in GNN_VARIANTS:
+            raise ValueError(f"Unknown gnn_variant {gnn_variant!r}. Expected one of {GNN_VARIANTS}.")
         self.job_feature_dim = int(job_feature_dim)
         self.machine_feature_dim = int(machine_feature_dim)
         self.edge_feature_dim = int(edge_feature_dim)
@@ -31,7 +38,12 @@ class BipartiteGNNRanker(nn.Module):
         self.num_layers = int(num_layers)
         self.dropout_p = float(dropout)
         self.candidate_feature_dim = int(candidate_feature_dim)
-        self.use_candidate_feature_fusion = bool(use_candidate_feature_fusion and candidate_feature_dim > 0)
+        self.gnn_variant = gnn_variant
+        self.residual_alpha_value = float(residual_alpha)
+        self.use_candidate_feature_fusion = bool(
+            gnn_variant == "gnn_v2_edge_fusion" and use_candidate_feature_fusion and candidate_feature_dim > 0
+        )
+        self.use_residual = gnn_variant == "gnn_residual"
 
         self.job_encoder = nn.Linear(job_feature_dim, hidden_dim)
         self.machine_encoder = nn.Linear(machine_feature_dim, hidden_dim)
@@ -51,6 +63,28 @@ class BipartiteGNNRanker(nn.Module):
         else:
             self.candidate_feature_encoder = None
             scorer_dim = hidden_dim
+        if self.use_residual:
+            if candidate_feature_dim <= 0:
+                raise ValueError("gnn_residual requires candidate_feature_dim > 0.")
+            self.mlp_score_head = nn.Sequential(
+                nn.Linear(candidate_feature_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 1),
+            )
+            self.gnn_delta_head = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, 1),
+            )
+            self.residual_alpha = nn.Parameter(torch.tensor(float(residual_alpha), dtype=torch.float32))
+        else:
+            self.mlp_score_head = None
+            self.gnn_delta_head = None
+            self.register_buffer("residual_alpha", torch.tensor(float(residual_alpha), dtype=torch.float32))
         self.scorer = nn.Sequential(
             nn.Linear(scorer_dim, hidden_dim),
             nn.ReLU(),
@@ -86,6 +120,12 @@ class BipartiteGNNRanker(nn.Module):
                 job_h = self.job_update_mlp[layer_idx](torch.cat([job_h, job_agg], dim=1))
 
         candidate_h = job_h[candidate_indices]
+        if self.use_residual:
+            if "candidate_features" not in graph:
+                raise KeyError("candidate_features are required when gnn_residual is enabled.")
+            mlp_score = self.mlp_score_head(graph["candidate_features"]).squeeze(-1)
+            gnn_delta_score = self.gnn_delta_head(candidate_h).squeeze(-1)
+            return mlp_score + self.residual_alpha * gnn_delta_score
         if self.use_candidate_feature_fusion:
             if "candidate_features" not in graph:
                 raise KeyError("candidate_features are required when candidate feature fusion is enabled.")
@@ -125,6 +165,8 @@ class LegacyBipartiteGNNRanker(nn.Module):
         self.dropout_p = 0.0
         self.candidate_feature_dim = 0
         self.use_candidate_feature_fusion = False
+        self.gnn_variant = "gnn_v1"
+        self.residual_alpha_value = 0.0
 
         self.job_encoder = nn.Linear(job_feature_dim, hidden_dim)
         self.machine_encoder = nn.Linear(machine_feature_dim, hidden_dim)
@@ -222,6 +264,8 @@ def save_checkpoint(path, model: BipartiteGNNRanker, metadata: dict | None = Non
             "dropout": model.dropout_p,
             "candidate_feature_dim": model.candidate_feature_dim,
             "use_candidate_feature_fusion": model.use_candidate_feature_fusion,
+            "gnn_variant": getattr(model, "gnn_variant", "gnn_v2_edge_fusion"),
+            "residual_alpha": float(getattr(model, "residual_alpha", torch.tensor(0.5)).detach().cpu()),
             "metadata": metadata or {},
         },
         path,
@@ -230,7 +274,8 @@ def save_checkpoint(path, model: BipartiteGNNRanker, metadata: dict | None = Non
 
 def load_checkpoint(path, device: str = "cpu") -> BipartiteGNNRanker:
     checkpoint = torch.load(path, map_location=device)
-    if "candidate_feature_dim" not in checkpoint:
+    checkpoint_variant = checkpoint.get("gnn_variant")
+    if checkpoint_variant == "gnn_v1" or "candidate_feature_dim" not in checkpoint:
         model = LegacyBipartiteGNNRanker(
             int(checkpoint["job_feature_dim"]),
             int(checkpoint["machine_feature_dim"]),
@@ -251,8 +296,10 @@ def load_checkpoint(path, device: str = "cpu") -> BipartiteGNNRanker:
         dropout=float(checkpoint.get("dropout", 0.0)),
         candidate_feature_dim=int(checkpoint.get("candidate_feature_dim", 0)),
         use_candidate_feature_fusion=bool(checkpoint.get("use_candidate_feature_fusion", False)),
+        gnn_variant=str(checkpoint.get("gnn_variant", "gnn_v2_edge_fusion")),
+        residual_alpha=float(checkpoint.get("residual_alpha", 0.5)),
     )
-    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
     return model

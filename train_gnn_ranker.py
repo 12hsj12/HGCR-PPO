@@ -12,7 +12,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from gnn_graph_builder import build_graph_from_env
-from gnn_ranker_models import BipartiteGNNRanker, graph_to_torch, save_checkpoint
+from gnn_ranker_models import (
+    GNN_VARIANTS,
+    BipartiteGNNRanker,
+    LegacyBipartiteGNNRanker,
+    graph_to_torch,
+    save_checkpoint,
+)
 from instance_manager import SIZES, load_fixed_instances
 from src.baselines.heuristics import choose_split_num
 from src.envs.rolling_scheduling_env import RollingSchedulingEnv
@@ -34,13 +40,13 @@ class GNNRankerDataset(Dataset):
         instances_by_id: Dict[str, object],
         top_k: int,
         device: str,
-        use_candidate_feature_fusion: bool,
+        include_candidate_features: bool,
     ):
         self.records = records
         self.instances_by_id = instances_by_id
         self.top_k = top_k
         self.device = device
-        self.use_candidate_feature_fusion = use_candidate_feature_fusion
+        self.include_candidate_features = include_candidate_features
 
     def __len__(self) -> int:
         return len(self.records)
@@ -57,7 +63,7 @@ class GNNRankerDataset(Dataset):
             "graph": graph_to_torch(
                 graph,
                 self.device,
-                candidate_features=candidate_features if self.use_candidate_feature_fusion else None,
+                candidate_features=candidate_features if self.include_candidate_features else None,
             ),
             "cmax": torch.tensor(record["oracle_cmax_per_candidate"], dtype=torch.float32, device=self.device),
             "label": int(record["best_candidate_index"]),
@@ -190,34 +196,61 @@ def train(
     weight_decay: float = 1e-4,
     patience: int = 10,
     use_candidate_feature_fusion: bool = True,
+    gnn_variant: str = "gnn_v2_edge_fusion",
+    residual_alpha: float = 0.5,
+    mlp_init_path: str | None = None,
     model_tag: str | None = None,
     device: str = "cpu",
     overwrite: bool = False,
 ) -> None:
     if loss_type != "soft_ce":
         raise ValueError("Stage D first version only supports --loss_type soft_ce.")
+    if gnn_variant not in GNN_VARIANTS:
+        raise ValueError(f"Unknown gnn_variant {gnn_variant!r}. Expected one of {GNN_VARIANTS}.")
+    if mlp_init_path:
+        print("--mlp_init_path is reserved for future MLP branch initialization and is not loaded yet.")
+
+    include_candidate_features = gnn_variant in {"gnn_v2_edge_fusion", "gnn_residual"} and use_candidate_feature_fusion
+    effective_fusion = gnn_variant == "gnn_v2_edge_fusion" and use_candidate_feature_fusion
+    if gnn_variant == "gnn_residual":
+        include_candidate_features = True
+        effective_fusion = False
+    if gnn_variant == "gnn_v2_no_fusion":
+        include_candidate_features = False
+        effective_fusion = False
     train_records = _load_records(size, top_k, "train", data_dir, dry_run, max_train_samples)
     val_records = _load_records(size, top_k, "val", data_dir, dry_run, max_train_samples if dry_run else None)
     instances_by_id = _load_instances(size)
-    train_dataset = GNNRankerDataset(train_records, instances_by_id, top_k, device, use_candidate_feature_fusion)
-    val_dataset = GNNRankerDataset(val_records, instances_by_id, top_k, device, use_candidate_feature_fusion)
+    train_dataset = GNNRankerDataset(train_records, instances_by_id, top_k, device, include_candidate_features)
+    val_dataset = GNNRankerDataset(val_records, instances_by_id, top_k, device, include_candidate_features)
     job_dim, machine_dim, edge_dim, candidate_dim = _infer_dims(train_dataset)
-    model = BipartiteGNNRanker(
-        job_dim,
-        machine_dim,
-        edge_dim,
-        hidden_dim=hidden_dim,
-        num_layers=num_layers,
-        dropout=dropout,
-        candidate_feature_dim=candidate_dim,
-        use_candidate_feature_fusion=use_candidate_feature_fusion,
-    ).to(device)
+    if gnn_variant == "gnn_v1":
+        model = LegacyBipartiteGNNRanker(
+            job_dim,
+            machine_dim,
+            edge_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+        ).to(device)
+    else:
+        model = BipartiteGNNRanker(
+            job_dim,
+            machine_dim,
+            edge_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            candidate_feature_dim=candidate_dim,
+            use_candidate_feature_fusion=effective_fusion,
+            gnn_variant=gnn_variant,
+            residual_alpha=residual_alpha,
+        ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=_collate)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=_collate)
 
     resolved_run_id = make_run_id(run_id)
-    resolved_model_tag = model_tag or "gnn_v2"
+    resolved_model_tag = model_tag or gnn_variant
     run_tokens = [size, f"topk{top_k}", loss_type]
     if resolved_model_tag:
         run_tokens.append(resolved_model_tag)
@@ -244,22 +277,41 @@ def train(
         "run_id": resolved_run_id,
         "model_tag": resolved_model_tag,
         "type": "gnn_ranker",
-        "version": "v2",
+        "version": "v2_diagnostics",
+        "gnn_variant": gnn_variant,
         "hidden_dim": hidden_dim,
         "num_layers": num_layers,
         "dropout": dropout,
         "weight_decay": weight_decay,
         "patience": patience,
+        "residual_alpha": residual_alpha,
+        "mlp_init_path": mlp_init_path or "",
         "candidate_feature_dim": candidate_dim,
-        "use_candidate_feature_fusion": use_candidate_feature_fusion,
+        "use_candidate_feature_fusion": effective_fusion,
     }
 
     best_val = float("inf")
     epochs_without_improvement = 0
+    early_stop_epoch = ""
     with log_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_loss", "val_top1_acc"])
+        fieldnames = [
+            "epoch",
+            "train_loss",
+            "val_loss",
+            "val_top1_acc",
+            "gnn_variant",
+            "residual_alpha",
+            "use_candidate_feature_fusion",
+            "hidden_dim",
+            "num_layers",
+            "dropout",
+            "weight_decay",
+            "best_val_loss",
+            "early_stop_epoch",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        desc = f"train-gnn-ranker {size} topk{top_k} {loss_type}"
+        desc = f"train-gnn-ranker {size} topk{top_k} {gnn_variant}"
         for epoch in progress_iter(range(1, epochs + 1), desc=desc, total=epochs):
             model.train()
             losses = []
@@ -273,20 +325,46 @@ def train(
                 losses.append(float(loss.detach().cpu()))
             val_loss, val_acc = evaluate(model, val_loader, temperature)
             train_loss = sum(losses) / max(1, len(losses))
-            writer.writerow({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_top1_acc": val_acc})
             if val_loss < best_val:
                 best_val = val_loss
                 epochs_without_improvement = 0
-                save_checkpoint(ckpt_dir / "best.pt", model, metadata)
+                best_metadata = dict(metadata)
+                best_metadata["best_val_loss"] = best_val
+                best_metadata["early_stop_epoch"] = early_stop_epoch
+                save_checkpoint(ckpt_dir / "best.pt", model, best_metadata)
             else:
                 epochs_without_improvement += 1
+            should_stop = False
             if dry_run:
-                break
-            if patience > 0 and epochs_without_improvement >= patience:
+                should_stop = True
+            elif patience > 0 and epochs_without_improvement >= patience:
+                early_stop_epoch = epoch
                 print(f"Early stopping after {epoch} epochs without validation improvement.")
+                should_stop = True
+            writer.writerow(
+                {
+                    "epoch": epoch,
+                    "train_loss": train_loss,
+                    "val_loss": val_loss,
+                    "val_top1_acc": val_acc,
+                    "gnn_variant": gnn_variant,
+                    "residual_alpha": residual_alpha,
+                    "use_candidate_feature_fusion": effective_fusion,
+                    "hidden_dim": hidden_dim,
+                    "num_layers": num_layers,
+                    "dropout": dropout,
+                    "weight_decay": weight_decay,
+                    "best_val_loss": best_val,
+                    "early_stop_epoch": early_stop_epoch,
+                }
+            )
+            if should_stop:
                 break
 
-    save_checkpoint(ckpt_dir / "last.pt", model, metadata)
+    final_metadata = dict(metadata)
+    final_metadata["best_val_loss"] = best_val
+    final_metadata["early_stop_epoch"] = early_stop_epoch
+    save_checkpoint(ckpt_dir / "last.pt", model, final_metadata)
     update_latest_dir(ckpt_dir, latest_ckpt_dir)
     print(f"Saved GNN-Ranker checkpoints to {ckpt_dir}")
     print(f"Updated GNN-Ranker latest checkpoints to {latest_ckpt_dir}")
@@ -328,6 +406,9 @@ def main() -> None:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--use_candidate_feature_fusion", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gnn_variant", choices=GNN_VARIANTS, default="gnn_v2_edge_fusion")
+    parser.add_argument("--residual_alpha", type=float, default=0.5)
+    parser.add_argument("--mlp_init_path", default=None)
     parser.add_argument("--model_tag", default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--overwrite", action="store_true")
