@@ -87,7 +87,11 @@ def _gnn_scores(model, env, candidates: List[str], device: str) -> List[float]:
     from gnn_graph_builder import build_graph_from_env
     from gnn_ranker_models import graph_to_torch
 
-    graph = graph_to_torch(build_graph_from_env(env, candidates), device=device)
+    graph = graph_to_torch(
+        build_graph_from_env(env, candidates),
+        device=device,
+        candidate_features=extract_candidate_features(env, candidates),
+    )
     with torch.no_grad():
         scores = model.forward_graph(graph)
     return [float(score) for score in scores.detach().cpu().tolist()]

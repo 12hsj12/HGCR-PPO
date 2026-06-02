@@ -16,16 +16,31 @@ from gnn_ranker_models import BipartiteGNNRanker, graph_to_torch, save_checkpoin
 from instance_manager import SIZES, load_fixed_instances
 from src.baselines.heuristics import choose_split_num
 from src.envs.rolling_scheduling_env import RollingSchedulingEnv
-from stage_c_utils import dataset_path, hybrid_candidates, load_ranker_records, oracle_cmax_per_candidate, best_candidate_index
+from stage_c_utils import (
+    best_candidate_index,
+    dataset_path,
+    extract_candidate_features,
+    hybrid_candidates,
+    load_ranker_records,
+    oracle_cmax_per_candidate,
+)
 from utils.experiment_io import make_result_path, make_run_dir, make_run_id, progress_iter, update_latest_dir
 
 
 class GNNRankerDataset(Dataset):
-    def __init__(self, records: List[Dict], instances_by_id: Dict[str, object], top_k: int, device: str):
+    def __init__(
+        self,
+        records: List[Dict],
+        instances_by_id: Dict[str, object],
+        top_k: int,
+        device: str,
+        use_candidate_feature_fusion: bool,
+    ):
         self.records = records
         self.instances_by_id = instances_by_id
         self.top_k = top_k
         self.device = device
+        self.use_candidate_feature_fusion = use_candidate_feature_fusion
 
     def __len__(self) -> int:
         return len(self.records)
@@ -35,8 +50,15 @@ class GNNRankerDataset(Dataset):
         env = reconstruct_env_for_record(record, self.instances_by_id)
         candidates = list(record.get("candidate_job_ids") or hybrid_candidates(env, self.top_k))
         graph = build_graph_from_env(env, candidates)
+        candidate_features = record.get("candidate_features")
+        if candidate_features is None:
+            candidate_features = extract_candidate_features(env, candidates)
         return {
-            "graph": graph_to_torch(graph, self.device),
+            "graph": graph_to_torch(
+                graph,
+                self.device,
+                candidate_features=candidate_features if self.use_candidate_feature_fusion else None,
+            ),
             "cmax": torch.tensor(record["oracle_cmax_per_candidate"], dtype=torch.float32, device=self.device),
             "label": int(record["best_candidate_index"]),
         }
@@ -69,6 +91,8 @@ def _collate(batch: List[Dict]) -> Dict:
 
 
 def soft_label_cross_entropy(scores: torch.Tensor, cmax: torch.Tensor, mask: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Compute candidate-set-local soft labels for each scheduling state."""
+
     masked_scores = scores.masked_fill(~mask, -1e9)
     masked_cmax = cmax.masked_fill(~mask, 1e9)
     labels = torch.softmax(-masked_cmax / max(temperature, 1e-6), dim=1)
@@ -137,12 +161,14 @@ def _load_instances(size: str) -> Dict[str, object]:
     return {getattr(instance, "instance_id", instance.name): instance for instance in instances}
 
 
-def _infer_dims(dataset: GNNRankerDataset) -> tuple[int, int, int]:
+def _infer_dims(dataset: GNNRankerDataset) -> tuple[int, int, int, int]:
     sample = dataset[0]["graph"]
+    candidate_dim = int(sample["candidate_features"].shape[1]) if "candidate_features" in sample else 0
     return (
         int(sample["job_features"].shape[1]),
         int(sample["machine_features"].shape[1]),
         int(sample["edge_features"].shape[1]),
+        candidate_dim,
     )
 
 
@@ -160,6 +186,11 @@ def train(
     temperature: float = 1.0,
     hidden_dim: int = 128,
     num_layers: int = 2,
+    dropout: float = 0.1,
+    weight_decay: float = 1e-4,
+    patience: int = 10,
+    use_candidate_feature_fusion: bool = True,
+    model_tag: str | None = None,
     device: str = "cpu",
     overwrite: bool = False,
 ) -> None:
@@ -168,18 +199,31 @@ def train(
     train_records = _load_records(size, top_k, "train", data_dir, dry_run, max_train_samples)
     val_records = _load_records(size, top_k, "val", data_dir, dry_run, max_train_samples if dry_run else None)
     instances_by_id = _load_instances(size)
-    train_dataset = GNNRankerDataset(train_records, instances_by_id, top_k, device)
-    val_dataset = GNNRankerDataset(val_records, instances_by_id, top_k, device)
-    job_dim, machine_dim, edge_dim = _infer_dims(train_dataset)
-    model = BipartiteGNNRanker(job_dim, machine_dim, edge_dim, hidden_dim=hidden_dim, num_layers=num_layers).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    train_dataset = GNNRankerDataset(train_records, instances_by_id, top_k, device, use_candidate_feature_fusion)
+    val_dataset = GNNRankerDataset(val_records, instances_by_id, top_k, device, use_candidate_feature_fusion)
+    job_dim, machine_dim, edge_dim, candidate_dim = _infer_dims(train_dataset)
+    model = BipartiteGNNRanker(
+        job_dim,
+        machine_dim,
+        edge_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        dropout=dropout,
+        candidate_feature_dim=candidate_dim,
+        use_candidate_feature_fusion=use_candidate_feature_fusion,
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=_collate)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=_collate)
 
     resolved_run_id = make_run_id(run_id)
+    resolved_model_tag = model_tag or "gnn_v2"
+    run_tokens = [size, f"topk{top_k}", loss_type]
+    if resolved_model_tag:
+        run_tokens.append(resolved_model_tag)
     ckpt_dir = make_run_dir(
         Path("checkpoints/stage_D/gnn_ranker"),
-        [size, f"topk{top_k}", loss_type],
+        run_tokens,
         f"runid{resolved_run_id}",
         overwrite=overwrite,
     )
@@ -189,7 +233,7 @@ def train(
     log_path = make_result_path(
         log_dir,
         "train",
-        [size, f"topk{top_k}", loss_type, f"runid{resolved_run_id}"],
+        [size, f"topk{top_k}", loss_type, resolved_model_tag, f"runid{resolved_run_id}"],
         run_id=None,
         overwrite=overwrite,
     )
@@ -198,12 +242,20 @@ def train(
         "top_k": top_k,
         "loss_type": loss_type,
         "run_id": resolved_run_id,
+        "model_tag": resolved_model_tag,
         "type": "gnn_ranker",
+        "version": "v2",
         "hidden_dim": hidden_dim,
         "num_layers": num_layers,
+        "dropout": dropout,
+        "weight_decay": weight_decay,
+        "patience": patience,
+        "candidate_feature_dim": candidate_dim,
+        "use_candidate_feature_fusion": use_candidate_feature_fusion,
     }
 
     best_val = float("inf")
+    epochs_without_improvement = 0
     with log_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_loss", "val_top1_acc"])
         writer.writeheader()
@@ -224,8 +276,14 @@ def train(
             writer.writerow({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_top1_acc": val_acc})
             if val_loss < best_val:
                 best_val = val_loss
+                epochs_without_improvement = 0
                 save_checkpoint(ckpt_dir / "best.pt", model, metadata)
+            else:
+                epochs_without_improvement += 1
             if dry_run:
+                break
+            if patience > 0 and epochs_without_improvement >= patience:
+                print(f"Early stopping after {epoch} epochs without validation improvement.")
                 break
 
     save_checkpoint(ckpt_dir / "last.pt", model, metadata)
@@ -266,6 +324,11 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--use_candidate_feature_fusion", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--model_tag", default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
