@@ -36,6 +36,11 @@ METHODS = [
     "mlp_ranker",
     "oracle_debug",
 ]
+DEFAULT_RULE_METHODS = [
+    "hybrid_topk_random",
+    "hybrid_topk_fifo_select",
+    "oracle_debug",
+]
 METRICS = [
     "Cmax_roll",
     "average_completion_time",
@@ -82,7 +87,13 @@ def _select_job(
         return min(candidates, key=lambda j: (fifo_order.get(j, 10**9), j))
     if method in {"mlp_bc", "mlp_ranker"}:
         if model is None:
-            raise ValueError(f"{method} requires --model_path.")
+            if method == "mlp_bc":
+                raise ValueError(
+                    "mlp_bc requires --bc_model_path. Please train MLP-BC first or remove mlp_bc from --methods."
+                )
+            raise ValueError(
+                "mlp_ranker requires --ranker_model_path. Please train MLP-Ranker first or remove mlp_ranker from --methods."
+            )
         return _model_select(model, env, candidates)
     if method == "oracle_debug":
         values = oracle_cmax or oracle_cmax_per_candidate(env, candidates, rollout_policy=oracle_rollout_policy)
@@ -135,7 +146,8 @@ def evaluate_ranker(
     size: str,
     split: str,
     top_k: int,
-    model_path: str | None,
+    bc_model_path: str | None,
+    ranker_model_path: str | None,
     methods: List[str],
     max_instances: int | None,
     seed: int,
@@ -146,10 +158,11 @@ def evaluate_ranker(
     if max_instances is not None:
         instances = instances[: max(0, max_instances)]
 
-    model = load_checkpoint(model_path) if model_path else None
+    models = _load_models_for_methods(methods, bc_model_path, ranker_model_path)
     rows: List[Dict] = []
     for instance in instances:
         for method in methods:
+            model = models.get(method)
             metrics = run_method(instance, method, top_k, seed, oracle_rollout_policy, model=model)
             rows.append(
                 {
@@ -162,6 +175,27 @@ def evaluate_ranker(
                 }
             )
     return rows
+
+
+def _load_models_for_methods(
+    methods: List[str],
+    bc_model_path: str | None,
+    ranker_model_path: str | None,
+) -> Dict[str, object]:
+    models: Dict[str, object] = {}
+    if "mlp_bc" in methods:
+        if not bc_model_path:
+            raise ValueError(
+                "mlp_bc requires --bc_model_path. Please train MLP-BC first or remove mlp_bc from --methods."
+            )
+        models["mlp_bc"] = load_checkpoint(bc_model_path)
+    if "mlp_ranker" in methods:
+        if not ranker_model_path:
+            raise ValueError(
+                "mlp_ranker requires --ranker_model_path. Please train MLP-Ranker first or remove mlp_ranker from --methods."
+            )
+        models["mlp_ranker"] = load_checkpoint(ranker_model_path)
+    return models
 
 
 def write_details(rows: Iterable[Dict], path: Path) -> None:
@@ -212,23 +246,28 @@ def main() -> None:
     parser.add_argument("--size", choices=SIZES, required=True)
     parser.add_argument("--split", choices=SPLITS, default="test")
     parser.add_argument("--top_k", type=int, default=5)
-    parser.add_argument("--model_path", default=None)
-    parser.add_argument("--methods", nargs="+", choices=METHODS, default=METHODS)
+    parser.add_argument("--bc_model_path", default=None)
+    parser.add_argument("--ranker_model_path", default=None)
+    parser.add_argument("--methods", nargs="+", choices=METHODS, default=DEFAULT_RULE_METHODS)
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--oracle_rollout_policy", choices=["fifo", "lookahead"], default="fifo")
     args = parser.parse_args()
 
-    rows = evaluate_ranker(
-        size=args.size,
-        split=args.split,
-        top_k=args.top_k,
-        model_path=args.model_path,
-        methods=args.methods,
-        max_instances=args.max_instances,
-        seed=args.seed,
-        oracle_rollout_policy=args.oracle_rollout_policy,
-    )
+    try:
+        rows = evaluate_ranker(
+            size=args.size,
+            split=args.split,
+            top_k=args.top_k,
+            bc_model_path=args.bc_model_path,
+            ranker_model_path=args.ranker_model_path,
+            methods=args.methods,
+            max_instances=args.max_instances,
+            seed=args.seed,
+            oracle_rollout_policy=args.oracle_rollout_policy,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     detail_path = RESULT_DIR / "ranker_eval.csv"
     summary_path = RESULT_DIR / "ranker_eval_summary.csv"
     write_details(rows, detail_path)
