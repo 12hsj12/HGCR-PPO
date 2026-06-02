@@ -107,11 +107,13 @@ def train(
     train_loader = DataLoader(RankerRecordDataset(train_records), batch_size=batch_size, shuffle=True, collate_fn=_collate)
     val_loader = DataLoader(RankerRecordDataset(val_records), batch_size=batch_size, shuffle=False, collate_fn=_collate)
 
+    experiment_name = f"{size}_topk{top_k}_{loss_type}"
     log_dir = Path("logs/stage_C/mlp_ranker")
-    ckpt_dir = Path("checkpoints/stage_C/mlp_ranker")
+    ckpt_dir = Path("checkpoints/stage_C/mlp_ranker") / experiment_name
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"train_{size}_topk{top_k}_{loss_type}.csv"
+    log_path = log_dir / f"train_{experiment_name}.csv"
+    checkpoint_metadata = {"size": size, "top_k": top_k, "loss_type": loss_type, "type": "mlp_ranker"}
 
     best_val = float("inf")
     with log_path.open("w", newline="") as f:
@@ -132,11 +134,11 @@ def train(
             writer.writerow({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss, "val_top1_acc": val_acc})
             if val_loss < best_val:
                 best_val = val_loss
-                save_checkpoint(ckpt_dir / "best.pt", model, input_dim, {"size": size, "top_k": top_k, "type": "mlp_ranker"})
+                save_checkpoint(ckpt_dir / "best.pt", model, input_dim, checkpoint_metadata)
             if dry_run:
                 break
 
-    save_checkpoint(ckpt_dir / "last.pt", model, input_dim, {"size": size, "top_k": top_k, "type": "mlp_ranker"})
+    save_checkpoint(ckpt_dir / "last.pt", model, input_dim, checkpoint_metadata)
     print(f"Saved MLP-Ranker checkpoints to {ckpt_dir}")
     print(f"Saved training log to {log_path}")
 

@@ -158,7 +158,7 @@ def evaluate_ranker(
     if max_instances is not None:
         instances = instances[: max(0, max_instances)]
 
-    models = _load_models_for_methods(methods, bc_model_path, ranker_model_path)
+    models = _load_models_for_methods(methods, bc_model_path, ranker_model_path, size, top_k)
     rows: List[Dict] = []
     for instance in instances:
         for method in methods:
@@ -181,6 +181,8 @@ def _load_models_for_methods(
     methods: List[str],
     bc_model_path: str | None,
     ranker_model_path: str | None,
+    size: str,
+    top_k: int,
 ) -> Dict[str, object]:
     models: Dict[str, object] = {}
     if "mlp_bc" in methods:
@@ -188,14 +190,36 @@ def _load_models_for_methods(
             raise ValueError(
                 "mlp_bc requires --bc_model_path. Please train MLP-BC first or remove mlp_bc from --methods."
             )
-        models["mlp_bc"] = load_checkpoint(bc_model_path)
+        bc_path = Path(bc_model_path)
+        if not bc_path.exists():
+            raise FileNotFoundError(_missing_bc_checkpoint_message(bc_path, size, top_k))
+        models["mlp_bc"] = load_checkpoint(bc_path)
     if "mlp_ranker" in methods:
         if not ranker_model_path:
             raise ValueError(
                 "mlp_ranker requires --ranker_model_path. Please train MLP-Ranker first or remove mlp_ranker from --methods."
             )
-        models["mlp_ranker"] = load_checkpoint(ranker_model_path)
+        ranker_path = Path(ranker_model_path)
+        if not ranker_path.exists():
+            raise FileNotFoundError(_missing_ranker_checkpoint_message(ranker_path, size, top_k))
+        models["mlp_ranker"] = load_checkpoint(ranker_path)
     return models
+
+
+def _missing_bc_checkpoint_message(path: Path, size: str, top_k: int) -> str:
+    return (
+        f"BC checkpoint not found: {path}\n"
+        "Please check whether train_mlp_bc.py saved the model under:\n"
+        f"checkpoints/stage_C/mlp_bc/{size}_topk{top_k}/best.pt"
+    )
+
+
+def _missing_ranker_checkpoint_message(path: Path, size: str, top_k: int) -> str:
+    return (
+        f"Ranker checkpoint not found: {path}\n"
+        "Please check whether train_mlp_ranker.py saved the model under:\n"
+        f"checkpoints/stage_C/mlp_ranker/{size}_topk{top_k}_{{loss_type}}/best.pt"
+    )
 
 
 def write_details(rows: Iterable[Dict], path: Path) -> None:
@@ -266,7 +290,7 @@ def main() -> None:
             seed=args.seed,
             oracle_rollout_policy=args.oracle_rollout_policy,
         )
-    except ValueError as exc:
+    except (ValueError, FileNotFoundError) as exc:
         raise SystemExit(str(exc)) from exc
     detail_path = RESULT_DIR / "ranker_eval.csv"
     summary_path = RESULT_DIR / "ranker_eval_summary.csv"
