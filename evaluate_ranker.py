@@ -58,6 +58,7 @@ ROW_FIELDS = [
     "size",
     "split",
     "top_k",
+    "model_tag",
     "instance_id",
     *METRICS,
     *VALIDATION_FIELDS,
@@ -146,6 +147,7 @@ def evaluate_ranker(
     size: str,
     split: str,
     top_k: int,
+    model_tag: str,
     bc_model_path: str | None,
     ranker_model_path: str | None,
     methods: List[str],
@@ -170,6 +172,7 @@ def evaluate_ranker(
                     "size": size,
                     "split": split,
                     "top_k": top_k,
+                    "model_tag": model_tag,
                     "instance_id": getattr(instance, "instance_id", instance.name),
                     **metrics,
                 }
@@ -232,18 +235,22 @@ def write_details(rows: Iterable[Dict], path: Path) -> None:
 
 def write_summary(rows: Iterable[Dict], path: Path) -> None:
     rows = list(rows)
-    grouped: Dict[tuple[str, str, str, int], List[Dict]] = {}
+    grouped: Dict[tuple[str, str, str, int, str], List[Dict]] = {}
     for row in rows:
-        grouped.setdefault((row["method"], row["size"], row["split"], int(row["top_k"])), []).append(row)
+        grouped.setdefault((row["method"], row["size"], row["split"], int(row["top_k"]), row["model_tag"]), []).append(row)
 
-    fieldnames = ["method", "size", "split", "top_k", "num_instances"]
-    for metric in METRICS:
-        fieldnames.extend([f"{metric}_mean", f"{metric}_std"])
-    fieldnames.extend(["valid_ratio", "cmax_check_pass_ratio"])
+    fieldnames = summary_fields()
 
     summary_rows = []
-    for (method, size, split, top_k), group in sorted(grouped.items()):
-        out = {"method": method, "size": size, "split": split, "top_k": top_k, "num_instances": len(group)}
+    for (method, size, split, top_k, model_tag), group in sorted(grouped.items()):
+        out = {
+            "method": method,
+            "size": size,
+            "split": split,
+            "top_k": top_k,
+            "model_tag": model_tag,
+            "num_instances": len(group),
+        }
         for metric in METRICS:
             values = [float(row[metric]) for row in group]
             out[f"{metric}_mean"] = mean(values)
@@ -259,6 +266,86 @@ def write_summary(rows: Iterable[Dict], path: Path) -> None:
         writer.writerows(summary_rows)
 
 
+def summary_fields() -> List[str]:
+    fieldnames = ["method", "size", "split", "top_k", "model_tag", "num_instances"]
+    for metric in METRICS:
+        fieldnames.extend([f"{metric}_mean", f"{metric}_std"])
+    fieldnames.extend(["valid_ratio", "cmax_check_pass_ratio"])
+    return fieldnames
+
+
+def result_paths(size: str, split: str, top_k: int, model_tag: str) -> tuple[Path, Path]:
+    safe_tag = _safe_model_tag(model_tag)
+    suffix = f"{size}_{split}_topk{top_k}_{safe_tag}"
+    return (
+        RESULT_DIR / f"ranker_eval_{suffix}.csv",
+        RESULT_DIR / f"ranker_eval_summary_{suffix}.csv",
+    )
+
+
+def _safe_model_tag(model_tag: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in model_tag.strip())
+    return safe or "untagged"
+
+
+def update_latest_and_all(rows: List[Dict]) -> None:
+    latest_detail_path = RESULT_DIR / "ranker_eval_latest.csv"
+    latest_summary_path = RESULT_DIR / "ranker_eval_summary_latest.csv"
+    write_details(rows, latest_detail_path)
+    write_summary(rows, latest_summary_path)
+    combine_result_files(
+        pattern="ranker_eval_*_topk*.csv",
+        output_path=RESULT_DIR / "ranker_eval_all.csv",
+        expected_fields=ROW_FIELDS,
+        exclude_names={
+            "ranker_eval.csv",
+            "ranker_eval_latest.csv",
+            "ranker_eval_all.csv",
+            "ranker_eval_summary.csv",
+            "ranker_eval_summary_latest.csv",
+            "ranker_eval_summary_all.csv",
+        },
+        exclude_prefixes=("ranker_eval_summary_",),
+    )
+    combine_result_files(
+        pattern="ranker_eval_summary_*_topk*.csv",
+        output_path=RESULT_DIR / "ranker_eval_summary_all.csv",
+        expected_fields=summary_fields(),
+        exclude_names={
+            "ranker_eval_summary.csv",
+            "ranker_eval_summary_latest.csv",
+            "ranker_eval_summary_all.csv",
+        },
+    )
+    print(f"Updated latest files: {latest_detail_path}, {latest_summary_path}")
+    print(f"Updated all files: {RESULT_DIR / 'ranker_eval_all.csv'}, {RESULT_DIR / 'ranker_eval_summary_all.csv'}")
+
+
+def combine_result_files(
+    pattern: str,
+    output_path: Path,
+    expected_fields: List[str],
+    exclude_names: set[str],
+    exclude_prefixes: tuple[str, ...] = (),
+) -> None:
+    combined_rows: List[Dict] = []
+    for path in sorted(RESULT_DIR.glob(pattern)):
+        if path.name in exclude_names or any(path.name.startswith(prefix) for prefix in exclude_prefixes):
+            continue
+        with path.open("r", newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames != expected_fields:
+                print(f"Warning: skipped {path} because CSV fields do not match the current schema.")
+                continue
+            combined_rows.extend(reader)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=expected_fields)
+        writer.writeheader()
+        writer.writerows(combined_rows)
+
+
 def _truthy(value) -> bool:
     if isinstance(value, str):
         return value.lower() in {"true", "1", "yes"}
@@ -270,6 +357,7 @@ def main() -> None:
     parser.add_argument("--size", choices=SIZES, required=True)
     parser.add_argument("--split", choices=SPLITS, default="test")
     parser.add_argument("--top_k", type=int, default=5)
+    parser.add_argument("--model_tag", default="rules_only")
     parser.add_argument("--bc_model_path", default=None)
     parser.add_argument("--ranker_model_path", default=None)
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=DEFAULT_RULE_METHODS)
@@ -283,6 +371,7 @@ def main() -> None:
             size=args.size,
             split=args.split,
             top_k=args.top_k,
+            model_tag=args.model_tag,
             bc_model_path=args.bc_model_path,
             ranker_model_path=args.ranker_model_path,
             methods=args.methods,
@@ -292,10 +381,10 @@ def main() -> None:
         )
     except (ValueError, FileNotFoundError) as exc:
         raise SystemExit(str(exc)) from exc
-    detail_path = RESULT_DIR / "ranker_eval.csv"
-    summary_path = RESULT_DIR / "ranker_eval_summary.csv"
+    detail_path, summary_path = result_paths(args.size, args.split, args.top_k, args.model_tag)
     write_details(rows, detail_path)
     write_summary(rows, summary_path)
+    update_latest_and_all(rows)
     print(f"Saved {len(rows)} rows to {detail_path}")
     print(f"Saved summary to {summary_path}")
 
