@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 from instance_manager import SIZES
 from mlp_models import CandidateScorer, save_checkpoint
 from stage_c_utils import dataset_path, load_ranker_records
+from utils.experiment_io import make_result_path, make_run_dir, make_run_id, update_latest_dir
 
 
 class RankerRecordDataset(Dataset):
@@ -70,6 +71,8 @@ def train(
     max_train_samples: int | None = None,
     dry_run: bool = False,
     data_dir: str = "data/ranker_dataset/",
+    run_id: str | None = None,
+    overwrite: bool = False,
 ) -> None:
     train_records = _load_records(size, top_k, "train", data_dir, dry_run)
     val_records = _load_records(size, top_k, "val", data_dir, dry_run)
@@ -84,13 +87,25 @@ def train(
     train_loader = DataLoader(RankerRecordDataset(train_records), batch_size=batch_size, shuffle=True, collate_fn=_collate)
     val_loader = DataLoader(RankerRecordDataset(val_records), batch_size=batch_size, shuffle=False, collate_fn=_collate)
 
-    experiment_name = f"{size}_topk{top_k}"
+    resolved_run_id = make_run_id(run_id)
     log_dir = Path("logs/stage_C/mlp_bc")
-    ckpt_dir = Path("checkpoints/stage_C/mlp_bc") / experiment_name
+    ckpt_dir = make_run_dir(
+        Path("checkpoints/stage_C/mlp_bc"),
+        [size, f"topk{top_k}"],
+        f"runid{resolved_run_id}",
+        overwrite=overwrite,
+    )
+    latest_ckpt_dir = Path("checkpoints/stage_C/mlp_bc") / f"{size}_topk{top_k}_latest"
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"train_{experiment_name}.csv"
-    checkpoint_metadata = {"size": size, "top_k": top_k, "type": "mlp_bc"}
+    log_path = make_result_path(
+        log_dir,
+        "train",
+        [size, f"topk{top_k}", f"runid{resolved_run_id}"],
+        run_id=None,
+        overwrite=overwrite,
+    )
+    checkpoint_metadata = {"size": size, "top_k": top_k, "run_id": resolved_run_id, "type": "mlp_bc"}
 
     best_val = float("inf")
     with log_path.open("w", newline="") as f:
@@ -118,7 +133,9 @@ def train(
                 break
 
     save_checkpoint(ckpt_dir / "last.pt", model, input_dim, checkpoint_metadata)
+    update_latest_dir(ckpt_dir, latest_ckpt_dir)
     print(f"Saved MLP-BC checkpoints to {ckpt_dir}")
+    print(f"Updated MLP-BC latest checkpoints to {latest_ckpt_dir}")
     print(f"Saved training log to {log_path}")
 
 
@@ -148,6 +165,8 @@ def main() -> None:
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--data_dir", default="data/ranker_dataset/")
+    parser.add_argument("--run_id", default=None)
+    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     train(**vars(args))
 

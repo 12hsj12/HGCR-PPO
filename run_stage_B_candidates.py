@@ -20,6 +20,7 @@ from schedule_validator import VALIDATION_FIELDS, validate_schedule
 from src.baselines.heuristics import choose_split_num, estimated_completion_time, lookahead_score
 from src.envs.rolling_scheduling_env import RollingSchedulingEnv
 from src.evaluation.metrics import compute_metrics
+from utils.experiment_io import make_result_path, make_run_id, rebuild_all_summary, update_latest_file
 
 
 RESULT_DIR = Path("data/results/stage_B")
@@ -235,11 +236,11 @@ def evaluate_candidate_ablation(
     return rows
 
 
-def result_paths(size: str, split: str, top_k: int) -> tuple[Path, Path]:
-    suffix = f"{size}_{split}_topk{int(top_k)}"
+def result_paths(size: str, split: str, top_k: int, run_id: str, overwrite: bool) -> tuple[Path, Path]:
+    tokens = [size, split, f"topk{int(top_k)}", f"runid{run_id}"]
     return (
-        RESULT_DIR / f"candidate_ablation_{suffix}.csv",
-        RESULT_DIR / f"candidate_ablation_summary_{suffix}.csv",
+        make_result_path(RESULT_DIR, "candidate_ablation", tokens, run_id=None, overwrite=overwrite),
+        make_result_path(RESULT_DIR, "candidate_ablation_summary", tokens, run_id=None, overwrite=overwrite),
     )
 
 
@@ -271,11 +272,7 @@ def write_summary(rows: Iterable[Dict], output_path: Path) -> List[Dict]:
         out["cmax_check_pass_ratio"] = mean(1.0 if _truthy(row["cmax_check_passed"]) else 0.0 for row in group)
         summary_rows.append(out)
 
-    fieldnames = ["method", "size", "split", "top_k", "num_instances"]
-    for metric in METRICS:
-        fieldnames.extend([f"{metric}_mean", f"{metric}_std"])
-    fieldnames.extend(DIAGNOSTIC_FIELDS)
-    fieldnames.extend(["valid_ratio", "cmax_check_pass_ratio"])
+    fieldnames = summary_fields()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="") as f:
@@ -285,36 +282,47 @@ def write_summary(rows: Iterable[Dict], output_path: Path) -> List[Dict]:
     return summary_rows
 
 
+def summary_fields() -> List[str]:
+    fieldnames = ["method", "size", "split", "top_k", "num_instances"]
+    for metric in METRICS:
+        fieldnames.extend([f"{metric}_mean", f"{metric}_std"])
+    fieldnames.extend(DIAGNOSTIC_FIELDS)
+    fieldnames.extend(["valid_ratio", "cmax_check_pass_ratio"])
+    return fieldnames
+
+
 def _truthy(value) -> bool:
     if isinstance(value, str):
         return value.lower() in {"true", "1", "yes"}
     return bool(value)
 
 
-def _is_detail_topk_file(path: Path) -> bool:
-    name = path.name
-    return (
-        name.startswith("candidate_ablation_")
-        and "_topk" in name
-        and not name.startswith("candidate_ablation_summary_")
-        and name not in {LATEST_DETAIL_CSV.name, ALL_DETAIL_CSV.name}
-    )
-
-
-def collect_topk_detail_rows(result_dir: Path = RESULT_DIR) -> List[Dict]:
-    rows: List[Dict] = []
-    for path in sorted(result_dir.glob("candidate_ablation_*_topk*.csv")):
-        if not _is_detail_topk_file(path):
-            continue
-        with path.open("r", newline="") as f:
-            rows.extend(csv.DictReader(f))
-    return rows
-
-
 def write_all_outputs(result_dir: Path = RESULT_DIR) -> tuple[Path, Path]:
-    rows = collect_topk_detail_rows(result_dir)
-    write_details(rows, ALL_DETAIL_CSV)
-    write_summary(rows, ALL_SUMMARY_CSV)
+    rebuild_all_summary(
+        result_dir=result_dir,
+        pattern="candidate_ablation_*_topk*.csv",
+        output_path=ALL_DETAIL_CSV,
+        fieldnames=ROW_FIELDS,
+        exclude_names={
+            "candidate_ablation_latest.csv",
+            "candidate_ablation_all.csv",
+            "candidate_ablation_summary_latest.csv",
+            "candidate_ablation_summary_all.csv",
+        },
+        exclude_prefixes=("candidate_ablation_summary_",),
+        required_substrings=("_runid",),
+    )
+    rebuild_all_summary(
+        result_dir=result_dir,
+        pattern="candidate_ablation_summary_*_topk*.csv",
+        output_path=ALL_SUMMARY_CSV,
+        fieldnames=summary_fields(),
+        exclude_names={
+            "candidate_ablation_summary_latest.csv",
+            "candidate_ablation_summary_all.csv",
+        },
+        required_substrings=("_runid",),
+    )
     return ALL_DETAIL_CSV, ALL_SUMMARY_CSV
 
 
@@ -326,7 +334,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--oracle_rollout_policy", choices=["fifo", "lookahead"], default="fifo")
+    parser.add_argument("--run_id", default=None)
+    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+    run_id = make_run_id(args.run_id)
 
     rows = evaluate_candidate_ablation(
         args.size,
@@ -336,11 +347,11 @@ def main() -> None:
         max_instances=args.max_instances,
         oracle_rollout_policy=args.oracle_rollout_policy,
     )
-    detail_path, summary_path = result_paths(args.size, args.split, args.top_k)
+    detail_path, summary_path = result_paths(args.size, args.split, args.top_k, run_id, args.overwrite)
     write_details(rows, detail_path)
-    write_details(rows, LATEST_DETAIL_CSV)
+    update_latest_file(rows, LATEST_DETAIL_CSV, ROW_FIELDS)
     summary_rows = write_summary(rows, summary_path)
-    write_summary(rows, LATEST_SUMMARY_CSV)
+    update_latest_file(summary_rows, LATEST_SUMMARY_CSV, summary_fields())
     all_detail_path, all_summary_path = write_all_outputs()
 
     print(f"Saved {len(rows)} rows to {detail_path}")

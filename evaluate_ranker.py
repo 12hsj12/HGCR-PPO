@@ -26,6 +26,14 @@ from stage_c_utils import (
     hybrid_candidates,
     oracle_cmax_per_candidate,
 )
+from utils.experiment_io import (
+    make_result_path,
+    make_run_id,
+    rebuild_all_summary,
+    sanitize_token,
+    save_csv_no_overwrite,
+    update_latest_file,
+)
 
 
 RESULT_DIR = Path("data/results/stage_C")
@@ -213,7 +221,9 @@ def _missing_bc_checkpoint_message(path: Path, size: str, top_k: int) -> str:
     return (
         f"BC checkpoint not found: {path}\n"
         "Please check whether train_mlp_bc.py saved the model under:\n"
-        f"checkpoints/stage_C/mlp_bc/{size}_topk{top_k}/best.pt"
+        f"checkpoints/stage_C/mlp_bc/{size}_topk{top_k}_runid{{run_id}}/best.pt\n"
+        "or use the latest checkpoint:\n"
+        f"checkpoints/stage_C/mlp_bc/{size}_topk{top_k}_latest/best.pt"
     )
 
 
@@ -221,7 +231,9 @@ def _missing_ranker_checkpoint_message(path: Path, size: str, top_k: int) -> str
     return (
         f"Ranker checkpoint not found: {path}\n"
         "Please check whether train_mlp_ranker.py saved the model under:\n"
-        f"checkpoints/stage_C/mlp_ranker/{size}_topk{top_k}_{{loss_type}}/best.pt"
+        f"checkpoints/stage_C/mlp_ranker/{size}_topk{top_k}_{{loss_type}}_runid{{run_id}}/best.pt\n"
+        "or use the latest checkpoint:\n"
+        f"checkpoints/stage_C/mlp_ranker/{size}_topk{top_k}_{{loss_type}}_latest/best.pt"
     )
 
 
@@ -234,12 +246,91 @@ def write_details(rows: Iterable[Dict], path: Path) -> None:
 
 
 def write_summary(rows: Iterable[Dict], path: Path) -> None:
+    fieldnames = summary_fields()
+    summary_rows = summarize_rows(rows)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+
+def summary_fields() -> List[str]:
+    fieldnames = ["method", "size", "split", "top_k", "model_tag", "num_instances"]
+    for metric in METRICS:
+        fieldnames.extend([f"{metric}_mean", f"{metric}_std"])
+    fieldnames.extend(["valid_ratio", "cmax_check_pass_ratio"])
+    return fieldnames
+
+
+def result_paths(size: str, split: str, top_k: int, model_tag: str, run_id: str, overwrite: bool) -> tuple[Path, Path]:
+    tokens = [size, split, f"topk{top_k}", model_tag, f"runid{run_id}"]
+    return (
+        make_result_path(RESULT_DIR, "ranker_eval", tokens, run_id="", overwrite=overwrite),
+        make_result_path(RESULT_DIR, "ranker_eval_summary", tokens, run_id="", overwrite=overwrite),
+    )
+
+
+def infer_model_tag(methods: List[str], bc_model_path: str | None, ranker_model_path: str | None, model_tag: str | None) -> str:
+    if model_tag:
+        return sanitize_token(model_tag)
+    model_methods = {"mlp_bc", "mlp_ranker"}
+    if not any(method in model_methods for method in methods):
+        return "rules_only"
+    ranker_path = str(ranker_model_path or "").lower()
+    if "soft_ce" in ranker_path:
+        return "soft_ce"
+    if "pairwise" in ranker_path:
+        return "pairwise"
+    if "mlp_bc" in methods and not ranker_model_path:
+        return "bc_only"
+    return "manual"
+
+
+def update_latest_and_all(rows: List[Dict]) -> None:
+    latest_detail_path = RESULT_DIR / "ranker_eval_latest.csv"
+    latest_summary_path = RESULT_DIR / "ranker_eval_summary_latest.csv"
+    update_latest_file(rows, latest_detail_path, ROW_FIELDS)
+    summary_rows = summarize_rows(rows)
+    update_latest_file(summary_rows, latest_summary_path, summary_fields())
+    rebuild_all_summary(
+        result_dir=RESULT_DIR,
+        pattern="ranker_eval_*_topk*.csv",
+        output_path=RESULT_DIR / "ranker_eval_all.csv",
+        fieldnames=ROW_FIELDS,
+        exclude_names={
+            "ranker_eval.csv",
+            "ranker_eval_latest.csv",
+            "ranker_eval_all.csv",
+            "ranker_eval_summary.csv",
+            "ranker_eval_summary_latest.csv",
+            "ranker_eval_summary_all.csv",
+        },
+        exclude_prefixes=("ranker_eval_summary_",),
+        required_substrings=("_runid",),
+    )
+    rebuild_all_summary(
+        result_dir=RESULT_DIR,
+        pattern="ranker_eval_summary_*_topk*.csv",
+        output_path=RESULT_DIR / "ranker_eval_summary_all.csv",
+        fieldnames=summary_fields(),
+        exclude_names={
+            "ranker_eval_summary.csv",
+            "ranker_eval_summary_latest.csv",
+            "ranker_eval_summary_all.csv",
+        },
+        required_substrings=("_runid",),
+    )
+    print(f"Updated latest files: {latest_detail_path}, {latest_summary_path}")
+    print(f"Updated all files: {RESULT_DIR / 'ranker_eval_all.csv'}, {RESULT_DIR / 'ranker_eval_summary_all.csv'}")
+
+
+def summarize_rows(rows: Iterable[Dict]) -> List[Dict]:
     rows = list(rows)
     grouped: Dict[tuple[str, str, str, int, str], List[Dict]] = {}
     for row in rows:
         grouped.setdefault((row["method"], row["size"], row["split"], int(row["top_k"]), row["model_tag"]), []).append(row)
-
-    fieldnames = summary_fields()
 
     summary_rows = []
     for (method, size, split, top_k, model_tag), group in sorted(grouped.items()):
@@ -258,92 +349,7 @@ def write_summary(rows: Iterable[Dict], path: Path) -> None:
         out["valid_ratio"] = mean(1.0 if _truthy(row["is_valid_schedule"]) else 0.0 for row in group)
         out["cmax_check_pass_ratio"] = mean(1.0 if _truthy(row["cmax_check_passed"]) else 0.0 for row in group)
         summary_rows.append(out)
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(summary_rows)
-
-
-def summary_fields() -> List[str]:
-    fieldnames = ["method", "size", "split", "top_k", "model_tag", "num_instances"]
-    for metric in METRICS:
-        fieldnames.extend([f"{metric}_mean", f"{metric}_std"])
-    fieldnames.extend(["valid_ratio", "cmax_check_pass_ratio"])
-    return fieldnames
-
-
-def result_paths(size: str, split: str, top_k: int, model_tag: str) -> tuple[Path, Path]:
-    safe_tag = _safe_model_tag(model_tag)
-    suffix = f"{size}_{split}_topk{top_k}_{safe_tag}"
-    return (
-        RESULT_DIR / f"ranker_eval_{suffix}.csv",
-        RESULT_DIR / f"ranker_eval_summary_{suffix}.csv",
-    )
-
-
-def _safe_model_tag(model_tag: str) -> str:
-    safe = "".join(ch if ch.isalnum() or ch in {"_", "-", "."} else "_" for ch in model_tag.strip())
-    return safe or "untagged"
-
-
-def update_latest_and_all(rows: List[Dict]) -> None:
-    latest_detail_path = RESULT_DIR / "ranker_eval_latest.csv"
-    latest_summary_path = RESULT_DIR / "ranker_eval_summary_latest.csv"
-    write_details(rows, latest_detail_path)
-    write_summary(rows, latest_summary_path)
-    combine_result_files(
-        pattern="ranker_eval_*_topk*.csv",
-        output_path=RESULT_DIR / "ranker_eval_all.csv",
-        expected_fields=ROW_FIELDS,
-        exclude_names={
-            "ranker_eval.csv",
-            "ranker_eval_latest.csv",
-            "ranker_eval_all.csv",
-            "ranker_eval_summary.csv",
-            "ranker_eval_summary_latest.csv",
-            "ranker_eval_summary_all.csv",
-        },
-        exclude_prefixes=("ranker_eval_summary_",),
-    )
-    combine_result_files(
-        pattern="ranker_eval_summary_*_topk*.csv",
-        output_path=RESULT_DIR / "ranker_eval_summary_all.csv",
-        expected_fields=summary_fields(),
-        exclude_names={
-            "ranker_eval_summary.csv",
-            "ranker_eval_summary_latest.csv",
-            "ranker_eval_summary_all.csv",
-        },
-    )
-    print(f"Updated latest files: {latest_detail_path}, {latest_summary_path}")
-    print(f"Updated all files: {RESULT_DIR / 'ranker_eval_all.csv'}, {RESULT_DIR / 'ranker_eval_summary_all.csv'}")
-
-
-def combine_result_files(
-    pattern: str,
-    output_path: Path,
-    expected_fields: List[str],
-    exclude_names: set[str],
-    exclude_prefixes: tuple[str, ...] = (),
-) -> None:
-    combined_rows: List[Dict] = []
-    for path in sorted(RESULT_DIR.glob(pattern)):
-        if path.name in exclude_names or any(path.name.startswith(prefix) for prefix in exclude_prefixes):
-            continue
-        with path.open("r", newline="") as f:
-            reader = csv.DictReader(f)
-            if reader.fieldnames != expected_fields:
-                print(f"Warning: skipped {path} because CSV fields do not match the current schema.")
-                continue
-            combined_rows.extend(reader)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=expected_fields)
-        writer.writeheader()
-        writer.writerows(combined_rows)
+    return summary_rows
 
 
 def _truthy(value) -> bool:
@@ -357,7 +363,9 @@ def main() -> None:
     parser.add_argument("--size", choices=SIZES, required=True)
     parser.add_argument("--split", choices=SPLITS, default="test")
     parser.add_argument("--top_k", type=int, default=5)
-    parser.add_argument("--model_tag", default="rules_only")
+    parser.add_argument("--model_tag", default=None)
+    parser.add_argument("--run_id", default=None)
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--bc_model_path", default=None)
     parser.add_argument("--ranker_model_path", default=None)
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=DEFAULT_RULE_METHODS)
@@ -365,13 +373,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--oracle_rollout_policy", choices=["fifo", "lookahead"], default="fifo")
     args = parser.parse_args()
+    run_id = make_run_id(args.run_id)
+    model_tag = infer_model_tag(args.methods, args.bc_model_path, args.ranker_model_path, args.model_tag)
 
     try:
         rows = evaluate_ranker(
             size=args.size,
             split=args.split,
             top_k=args.top_k,
-            model_tag=args.model_tag,
+            model_tag=model_tag,
             bc_model_path=args.bc_model_path,
             ranker_model_path=args.ranker_model_path,
             methods=args.methods,
@@ -381,9 +391,10 @@ def main() -> None:
         )
     except (ValueError, FileNotFoundError) as exc:
         raise SystemExit(str(exc)) from exc
-    detail_path, summary_path = result_paths(args.size, args.split, args.top_k, args.model_tag)
-    write_details(rows, detail_path)
-    write_summary(rows, summary_path)
+    detail_path, summary_path = result_paths(args.size, args.split, args.top_k, model_tag, run_id, args.overwrite)
+    detail_path = save_csv_no_overwrite(rows, detail_path, ROW_FIELDS, overwrite=True)
+    summary_rows = summarize_rows(rows)
+    summary_path = save_csv_no_overwrite(summary_rows, summary_path, summary_fields(), overwrite=True)
     update_latest_and_all(rows)
     print(f"Saved {len(rows)} rows to {detail_path}")
     print(f"Saved summary to {summary_path}")
