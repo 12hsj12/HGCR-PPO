@@ -18,7 +18,7 @@ from candidate_generator import generate_candidates
 from instance_manager import SIZES, SPLITS, ensure_fixed_dataset, load_fixed_instances
 from src.baselines.heuristics import choose_split_num
 from src.envs.rolling_scheduling_env import RollingSchedulingEnv
-from src.rules.experience_rule_library import ExperienceRuleLibrary, RULE_NAMES
+from src.rules.experience_rule_library import ExperienceRuleLibrary, RULE_NAMES, RULE_TIEBREAK
 from utils.experiment_io import write_csv
 
 
@@ -50,6 +50,30 @@ def output_paths(args, run_id: str) -> Dict[str, Path]:
     }
 
 
+def select_label(args, library: ExperienceRuleLibrary, recommendations):
+    if args.label_mode in {"one_step_cmax", "one_step_ect"}:
+        return library.label_from_proxy(recommendations)
+
+    if args.label_mode != "conservative_margin":
+        raise ValueError(f"Unsupported label_mode: {args.label_mode}")
+
+    baseline = next((rec for rec in recommendations if rec.rule_name == args.baseline_rule), None)
+    if baseline is None or not baseline.is_valid:
+        raise RuntimeError(
+            f"conservative_margin requires a valid baseline_rule={args.baseline_rule!r}; "
+            "check ranker checkpoint and HybridTopK candidates."
+        )
+
+    other_valid = [rec for rec in recommendations if rec.is_valid and rec.rule_name != args.baseline_rule]
+    if not other_valid:
+        return baseline
+
+    best_other = min(other_valid, key=lambda rec: (rec.score_or_proxy, RULE_TIEBREAK.get(rec.rule_name, 999), rec.rule_id))
+    if best_other.score_or_proxy < baseline.score_or_proxy - float(args.label_margin):
+        return best_other
+    return baseline
+
+
 def build_dataset(args) -> Dict[str, Path]:
     run_id = make_run_id(args)
     paths = output_paths(args, run_id)
@@ -74,7 +98,7 @@ def build_dataset(args) -> Dict[str, Path]:
         while not env.is_done():
             candidates = generate_candidates(env, candidate_mode="hybrid_topk", top_k=args.top_k, fallback_to_all=True)
             recommendations = library.recommend(env, candidates)
-            label = library.label_from_proxy(recommendations)
+            label = select_label(args, library, recommendations)
             state_features = library.state_features(env, candidates, recommendations)
             candidate_features = []
             try:
@@ -127,17 +151,27 @@ def build_dataset(args) -> Dict[str, Path]:
     label_rows = []
     for rule_name in RULE_NAMES:
         valid_count = valid_counts[rule_name]
+        label_ratio = label_counts[rule_name] / total_labels
         label_rows.append(
             {
                 "rule_name": rule_name,
                 "label_count": label_counts[rule_name],
-                "label_ratio": label_counts[rule_name] / total_labels,
+                "label_ratio": label_ratio,
                 "valid_count": valid_count,
                 "valid_ratio": valid_count / total_states,
                 "mean_proxy_score": proxy_sums[rule_name] / max(1, valid_count),
             }
         )
     write_csv(label_rows, paths["label_stats"], LABEL_FIELDS)
+    min_cmax_ratio = label_counts["min_cmax_onestep"] / total_labels
+    ranker_ratio = label_counts["mlp_ranker_soft_ce"] / total_labels
+    warnings = []
+    if min_cmax_ratio > 0.6:
+        warnings.append(f"WARNING: min_cmax_onestep label_ratio={min_cmax_ratio:.4f} > 0.6")
+    if ranker_ratio < 0.3:
+        warnings.append(f"WARNING: mlp_ranker_soft_ce label_ratio={ranker_ratio:.4f} < 0.3")
+    for message in warnings:
+        print(message)
     paths["manifest"].write_text(
         json.dumps(
             {
@@ -145,6 +179,7 @@ def build_dataset(args) -> Dict[str, Path]:
                 "start_time": datetime.now().isoformat(timespec="seconds"),
                 "command_args": vars(args),
                 "dataset_path": str(paths["dataset"]),
+                "warnings": warnings,
                 "python_version": sys.version,
             },
             indent=2,
@@ -161,7 +196,13 @@ def main() -> None:
     parser.add_argument("--split", choices=SPLITS, default="train")
     parser.add_argument("--top_k", type=int, default=5)
     parser.add_argument("--ranker_ckpt", default="checkpoints/stage_C/mlp_ranker/small_topk5_soft_ce/best.pt")
-    parser.add_argument("--label_mode", choices=["one_step_cmax", "one_step_ect"], default="one_step_cmax")
+    parser.add_argument(
+        "--label_mode",
+        choices=["one_step_cmax", "one_step_ect", "conservative_margin"],
+        default="one_step_cmax",
+    )
+    parser.add_argument("--baseline_rule", choices=RULE_NAMES, default="mlp_ranker_soft_ce")
+    parser.add_argument("--label_margin", type=float, default=0.5)
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--output_dir", default="data/processed/stage_F/rule_library_bc")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
