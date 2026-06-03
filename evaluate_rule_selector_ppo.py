@@ -16,7 +16,7 @@ import torch
 from candidate_generator import fifo_ranked
 from instance_manager import SIZES, SPLITS, ensure_fixed_dataset, load_fixed_instances
 from mlp_models import load_checkpoint
-from rule_selector_env import RuleSelectorEnv
+from rule_selector_env import ACTION_MODES, BASELINE_TYPES, CONSERVATIVE_MODES, RuleSelectorEnv
 from schedule_validator import VALIDATION_FIELDS, validate_schedule
 from src.baselines.heuristics import choose_split_num
 from src.envs.rolling_scheduling_env import RollingSchedulingEnv
@@ -44,6 +44,16 @@ METRICS = [
     "rule_greedy_ratio",
     "rule_minload_ratio",
     "rule_ranker_ratio",
+    "rule_non_ranker_ratio",
+    "fallback_count",
+    "fallback_ratio",
+    "keep_ranker_ratio",
+    "switch_to_fifo_ratio",
+    "switch_to_lookahead_ratio",
+    "switch_to_greedy_ratio",
+    "switch_to_minload_ratio",
+    "switch_to_pairwise_ratio",
+    "effective_switch_ratio",
 ]
 ROW_FIELDS = [
     "method",
@@ -52,8 +62,13 @@ ROW_FIELDS = [
     "top_k",
     "run_id",
     "instance_id",
+    "action_mode",
+    "conservative_mode",
+    "baseline_type",
     *METRICS,
     "rule_distribution",
+    "ppo_raw_rule_distribution",
+    "executed_rule_distribution",
     *VALIDATION_FIELDS,
 ]
 
@@ -123,16 +138,22 @@ def run_method(instance, method: str, top_k: int, seed: int, ranker_model=None, 
             top_k=top_k,
             mlp_soft_model_path=args.mlp_soft_model_path if args else None,
             mlp_pairwise_model_path=args.mlp_pairwise_model_path if args else None,
+            action_mode=args.action_mode if args else "rule_selector",
+            conservative_mode=args.conservative_mode if args else "none",
+            fallback_threshold=args.fallback_threshold if args else 0.6,
+            switch_penalty=args.switch_penalty if args else 0.01,
+            baseline_type=args.baseline_type if args else "fifo",
         )
         state = env.reset(instance)
         model = ppo_model
         if model is None:
             model = _load_rule_selector_model(args.resolved_ppo_model_path, len(state), env.action_dim)
         while not env.env.is_done():
-            action, _, _ = select_action(model, state, env.action_mask(), torch.device("cpu"), greedy=True)
-            state, _, _, _ = env.step(action)
+            action, _, _, action_prob = select_action(model, state, env.action_mask(), torch.device("cpu"), greedy=True)
+            state, _, _, _ = env.step(action, action_probability=action_prob)
         base_env = env.env
-        rule_distribution.update(env.rule_distribution())
+        diagnostics = env.diagnostics()
+        rule_distribution.update(diagnostics["executed_rule_distribution"])
     else:
         env = RollingSchedulingEnv(instance)
         env.reset(instance)
@@ -152,6 +173,21 @@ def run_method(instance, method: str, top_k: int, seed: int, ranker_model=None, 
                     job_id = rng.choice(candidates)
             env.step((job_id, choose_split_num(env, job_id)))
         base_env = env
+        diagnostics = {
+            "ppo_raw_rule_distribution": rule_distribution,
+            "executed_rule_distribution": rule_distribution,
+            "rule_ranker_ratio": 0.0,
+            "rule_non_ranker_ratio": 0.0,
+            "fallback_count": 0.0,
+            "fallback_ratio": 0.0,
+            "keep_ranker_ratio": 0.0,
+            "switch_to_fifo_ratio": 0.0,
+            "switch_to_lookahead_ratio": 0.0,
+            "switch_to_greedy_ratio": 0.0,
+            "switch_to_minload_ratio": 0.0,
+            "switch_to_pairwise_ratio": 0.0,
+            "effective_switch_ratio": 0.0,
+        }
 
     metrics = compute_metrics(base_env)
     validation = validate_schedule(base_env, instance)
@@ -163,7 +199,21 @@ def run_method(instance, method: str, top_k: int, seed: int, ranker_model=None, 
     metrics["rule_greedy_ratio"] = rule_distribution.get("greedy_ect", 0.0)
     metrics["rule_minload_ratio"] = rule_distribution.get("minload", 0.0)
     metrics["rule_ranker_ratio"] = rule_distribution.get("mlp_ranker_soft_ce", 0.0) + rule_distribution.get("mlp_ranker_pairwise", 0.0)
+    if method == "rule_selector_ppo":
+        metrics["rule_ranker_ratio"] = float(diagnostics["rule_ranker_ratio"])
+    metrics["rule_non_ranker_ratio"] = float(diagnostics["rule_non_ranker_ratio"])
+    metrics["fallback_count"] = float(diagnostics["fallback_count"])
+    metrics["fallback_ratio"] = float(diagnostics["fallback_ratio"])
+    metrics["keep_ranker_ratio"] = float(diagnostics["keep_ranker_ratio"])
+    metrics["switch_to_fifo_ratio"] = float(diagnostics["switch_to_fifo_ratio"])
+    metrics["switch_to_lookahead_ratio"] = float(diagnostics["switch_to_lookahead_ratio"])
+    metrics["switch_to_greedy_ratio"] = float(diagnostics["switch_to_greedy_ratio"])
+    metrics["switch_to_minload_ratio"] = float(diagnostics["switch_to_minload_ratio"])
+    metrics["switch_to_pairwise_ratio"] = float(diagnostics["switch_to_pairwise_ratio"])
+    metrics["effective_switch_ratio"] = float(diagnostics["effective_switch_ratio"])
     metrics["rule_distribution"] = json.dumps(rule_distribution, sort_keys=True)
+    metrics["ppo_raw_rule_distribution"] = json.dumps(diagnostics["ppo_raw_rule_distribution"], sort_keys=True)
+    metrics["executed_rule_distribution"] = json.dumps(diagnostics["executed_rule_distribution"], sort_keys=True)
     metrics.update(validation)
     return metrics
 
@@ -177,7 +227,17 @@ def evaluate(args) -> List[Dict]:
     ranker_model = load_checkpoint(args.mlp_soft_model_path) if args.mlp_soft_model_path and Path(args.mlp_soft_model_path).exists() else None
     ppo_model = None
     if "rule_selector_ppo" in args.methods and args.resolved_ppo_model_path:
-        probe = RuleSelectorEnv(instances[0], top_k=args.top_k, mlp_soft_model_path=args.mlp_soft_model_path)
+        probe = RuleSelectorEnv(
+            instances[0],
+            top_k=args.top_k,
+            mlp_soft_model_path=args.mlp_soft_model_path,
+            mlp_pairwise_model_path=args.mlp_pairwise_model_path,
+            action_mode=args.action_mode,
+            conservative_mode=args.conservative_mode,
+            fallback_threshold=args.fallback_threshold,
+            switch_penalty=args.switch_penalty,
+            baseline_type=args.baseline_type,
+        )
         ppo_model = _load_rule_selector_model(args.resolved_ppo_model_path, len(probe.reset(instances[0])), probe.action_dim)
 
     rows = []
@@ -200,6 +260,9 @@ def evaluate(args) -> List[Dict]:
                     "top_k": args.top_k,
                     "run_id": args.run_id,
                     "instance_id": getattr(instance, "instance_id", getattr(instance, "name", "")),
+                    "action_mode": args.action_mode,
+                    "conservative_mode": args.conservative_mode,
+                    "baseline_type": args.baseline_type,
                     **metrics,
                 }
             )
@@ -208,12 +271,34 @@ def evaluate(args) -> List[Dict]:
 
 def summarize_rows(rows: Iterable[Dict]) -> List[Dict]:
     rows = list(rows)
-    grouped: Dict[tuple[str, str, str, int, str], List[Dict]] = {}
+    grouped: Dict[tuple[str, str, str, int, str, str, str, str], List[Dict]] = {}
     for row in rows:
-        grouped.setdefault((row["method"], row["size"], row["split"], int(row["top_k"]), row["run_id"]), []).append(row)
+        grouped.setdefault(
+            (
+                row["method"],
+                row["size"],
+                row["split"],
+                int(row["top_k"]),
+                row["run_id"],
+                row["action_mode"],
+                row["conservative_mode"],
+                row["baseline_type"],
+            ),
+            [],
+        ).append(row)
     summary = []
-    for (method, size, split, top_k, run_id), group in sorted(grouped.items()):
-        out = {"method": method, "size": size, "split": split, "top_k": top_k, "run_id": run_id, "num_instances": len(group)}
+    for (method, size, split, top_k, run_id, action_mode, conservative_mode, baseline_type), group in sorted(grouped.items()):
+        out = {
+            "method": method,
+            "size": size,
+            "split": split,
+            "top_k": top_k,
+            "run_id": run_id,
+            "action_mode": action_mode,
+            "conservative_mode": conservative_mode,
+            "baseline_type": baseline_type,
+            "num_instances": len(group),
+        }
         for metric in METRICS:
             values = [float(row[metric]) for row in group]
             out[f"{metric}_mean"] = mean(values)
@@ -223,7 +308,7 @@ def summarize_rows(rows: Iterable[Dict]) -> List[Dict]:
 
 
 def summary_fields() -> List[str]:
-    fields = ["method", "size", "split", "top_k", "run_id", "num_instances"]
+    fields = ["method", "size", "split", "top_k", "run_id", "action_mode", "conservative_mode", "baseline_type", "num_instances"]
     for metric in METRICS:
         fields.extend([f"{metric}_mean", f"{metric}_std"])
     return fields
@@ -258,7 +343,15 @@ def update_latest_all(rows: List[Dict]) -> None:
 def clean_stage_f_summary_rows(rows: Iterable[Dict]) -> List[Dict]:
     chosen: Dict[tuple[str, str, str, str], Dict] = {}
     for row in rows:
-        key = (row["size"], row["split"], str(row["top_k"]), row["method"])
+        key = (
+            row["size"],
+            row["split"],
+            str(row["top_k"]),
+            row["method"],
+            row.get("action_mode", "rule_selector"),
+            row.get("conservative_mode", "none"),
+            row.get("baseline_type", "fifo"),
+        )
         current = chosen.get(key)
         if current is None or str(row.get("run_id", "")) >= str(current.get("run_id", "")):
             chosen[key] = row
@@ -275,6 +368,11 @@ def main() -> None:
     parser.add_argument("--ppo_model_path", default=None, help="Alias for --checkpoint_path.")
     parser.add_argument("--mlp_soft_model_path", default=None)
     parser.add_argument("--mlp_pairwise_model_path", default=None)
+    parser.add_argument("--conservative_mode", choices=CONSERVATIVE_MODES, default="none")
+    parser.add_argument("--fallback_threshold", type=float, default=0.6)
+    parser.add_argument("--switch_penalty", type=float, default=0.01)
+    parser.add_argument("--baseline_type", choices=BASELINE_TYPES, default="fifo")
+    parser.add_argument("--action_mode", choices=ACTION_MODES, default="rule_selector")
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=METHODS)
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)

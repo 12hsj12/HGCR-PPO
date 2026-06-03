@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from instance_manager import SIZES, ensure_fixed_dataset, load_fixed_instances
-from rule_selector_env import ALL_RULES, RuleSelectorEnv
+from rule_selector_env import ACTION_MODES, BASELINE_TYPES, CONSERVATIVE_MODES, RuleSelectorEnv
 from utils.experiment_io import make_result_path, make_run_dir, make_run_id, update_latest_dir, write_csv, progress_iter
 
 
@@ -100,7 +100,8 @@ def select_action(model: RuleActorCritic, state: np.ndarray, mask: np.ndarray, d
         dist, value = model.dist_value(state_t, mask_t)
         action_t = torch.argmax(dist.probs, dim=-1) if greedy else dist.sample()
         logprob = dist.log_prob(action_t)
-    return int(action_t.item()), float(logprob.item()), float(value.item())
+        probability = dist.probs[0, action_t.item()]
+    return int(action_t.item()), float(logprob.item()), float(value.item()), float(probability.item())
 
 
 def update_model(
@@ -158,11 +159,16 @@ def evaluate_validation(model, instances, args, device: torch.device, max_eval_i
             top_k=args.top_k,
             mlp_soft_model_path=args.mlp_soft_model_path,
             mlp_pairwise_model_path=args.mlp_pairwise_model_path,
+            action_mode=args.action_mode,
+            conservative_mode=args.conservative_mode,
+            fallback_threshold=args.fallback_threshold,
+            switch_penalty=args.switch_penalty,
+            baseline_type=args.baseline_type,
         )
         state = env.reset(instance)
         while not env.env.is_done():
-            action, _, _ = select_action(model, state, env.action_mask(), device, greedy=True)
-            state, _, _, _ = env.step(action)
+            action, _, _, action_prob = select_action(model, state, env.action_mask(), device, greedy=True)
+            state, _, _, _ = env.step(action, action_probability=action_prob)
         cmax_values.append(float(env.env.current_cmax))
     return mean(cmax_values) if cmax_values else float("inf")
 
@@ -174,13 +180,18 @@ def save_checkpoint(path: Path, model: RuleActorCritic, args, state_dim: int, ac
             "model_state_dict": model.state_dict(),
             "state_dim": state_dim,
             "action_dim": action_dim,
-            "rule_names": list(ALL_RULES),
+            "rule_names": list(args.rule_names),
             "metadata": {
                 "size": args.size,
                 "top_k": args.top_k,
                 "run_id": args.run_id,
                 "best_val_cmax": best_val_cmax,
                 "type": "rule_selector_ppo",
+                "action_mode": args.action_mode,
+                "conservative_mode": args.conservative_mode,
+                "fallback_threshold": args.fallback_threshold,
+                "switch_penalty": args.switch_penalty,
+                "baseline_type": args.baseline_type,
             },
         },
         path,
@@ -208,9 +219,15 @@ def train(args) -> None:
         top_k=args.top_k,
         mlp_soft_model_path=args.mlp_soft_model_path,
         mlp_pairwise_model_path=args.mlp_pairwise_model_path,
+        action_mode=args.action_mode,
+        conservative_mode=args.conservative_mode,
+        fallback_threshold=args.fallback_threshold,
+        switch_penalty=args.switch_penalty,
+        baseline_type=args.baseline_type,
     )
     state_dim = len(probe_env.reset(train_instances[0]))
     action_dim = probe_env.action_dim
+    args.rule_names = list(probe_env.rule_names)
     model = RuleActorCritic(state_dim, action_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
@@ -233,6 +250,23 @@ def train(args) -> None:
         "episode_reward",
         "final_cmax",
         "fifo_cmax",
+        "ranker_cmax",
+        "baseline_type",
+        "conservative_mode",
+        "fallback_threshold",
+        "switch_penalty",
+        "action_mode",
+        "rule_ranker_ratio",
+        "rule_non_ranker_ratio",
+        "fallback_count",
+        "fallback_ratio",
+        "keep_ranker_ratio",
+        "switch_to_fifo_ratio",
+        "switch_to_lookahead_ratio",
+        "switch_to_greedy_ratio",
+        "switch_to_minload_ratio",
+        "switch_to_pairwise_ratio",
+        "effective_switch_ratio",
         "val_cmax",
         "policy_loss",
         "value_loss",
@@ -253,14 +287,19 @@ def train(args) -> None:
                 top_k=args.top_k,
                 mlp_soft_model_path=args.mlp_soft_model_path,
                 mlp_pairwise_model_path=args.mlp_pairwise_model_path,
+                action_mode=args.action_mode,
+                conservative_mode=args.conservative_mode,
+                fallback_threshold=args.fallback_threshold,
+                switch_penalty=args.switch_penalty,
+                baseline_type=args.baseline_type,
                 seed=args.seed + episode,
             )
             state = env.reset(instance)
             episode_reward = 0.0
             while not env.env.is_done():
                 mask = env.action_mask()
-                action, logprob, value = select_action(model, state, mask, device, greedy=False)
-                next_state, reward, done, _ = env.step(action)
+                action, logprob, value, action_prob = select_action(model, state, mask, device, greedy=False)
+                next_state, reward, done, _ = env.step(action, action_probability=action_prob)
                 buffer.add(state, action, mask, logprob, reward, done, value)
                 state = next_state
                 episode_reward += reward
@@ -277,6 +316,7 @@ def train(args) -> None:
                 args.batch_size,
                 device,
             )
+            diagnostics = env.diagnostics()
             val_cmax = evaluate_validation(model, val_instances, args, device, max_eval_instances=1 if args.dry_run else 5)
             if val_cmax < best_val:
                 best_val = val_cmax
@@ -287,6 +327,23 @@ def train(args) -> None:
                 "episode_reward": episode_reward,
                 "final_cmax": float(env.env.current_cmax),
                 "fifo_cmax": float(env.fifo_cmax),
+                "ranker_cmax": float(env.ranker_cmax),
+                "baseline_type": args.baseline_type,
+                "conservative_mode": args.conservative_mode,
+                "fallback_threshold": args.fallback_threshold,
+                "switch_penalty": args.switch_penalty,
+                "action_mode": args.action_mode,
+                "rule_ranker_ratio": diagnostics["rule_ranker_ratio"],
+                "rule_non_ranker_ratio": diagnostics["rule_non_ranker_ratio"],
+                "fallback_count": diagnostics["fallback_count"],
+                "fallback_ratio": diagnostics["fallback_ratio"],
+                "keep_ranker_ratio": diagnostics["keep_ranker_ratio"],
+                "switch_to_fifo_ratio": diagnostics["switch_to_fifo_ratio"],
+                "switch_to_lookahead_ratio": diagnostics["switch_to_lookahead_ratio"],
+                "switch_to_greedy_ratio": diagnostics["switch_to_greedy_ratio"],
+                "switch_to_minload_ratio": diagnostics["switch_to_minload_ratio"],
+                "switch_to_pairwise_ratio": diagnostics["switch_to_pairwise_ratio"],
+                "effective_switch_ratio": diagnostics["effective_switch_ratio"],
                 "val_cmax": val_cmax,
                 **stats,
             }
@@ -302,10 +359,23 @@ def train(args) -> None:
         "top_k": args.top_k,
         "run_id": resolved_run_id,
         "episodes": len(rows),
+        "action_mode": args.action_mode,
+        "conservative_mode": args.conservative_mode,
+        "baseline_type": args.baseline_type,
         "best_val_cmax": best_val,
         "final_train_cmax": rows[-1]["final_cmax"] if rows else 0.0,
     }]
-    summary_fields = ["size", "top_k", "run_id", "episodes", "best_val_cmax", "final_train_cmax"]
+    summary_fields = [
+        "size",
+        "top_k",
+        "run_id",
+        "episodes",
+        "action_mode",
+        "conservative_mode",
+        "baseline_type",
+        "best_val_cmax",
+        "final_train_cmax",
+    ]
     summary_dir = Path("logs/stage_F/rule_selector_ppo")
     write_csv(summary, summary_dir / "train_summary_latest.csv", summary_fields)
     all_path = summary_dir / "train_summary_all.csv"
@@ -337,6 +407,11 @@ def main() -> None:
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--mlp_soft_model_path", default=None)
     parser.add_argument("--mlp_pairwise_model_path", default=None)
+    parser.add_argument("--conservative_mode", choices=CONSERVATIVE_MODES, default="none")
+    parser.add_argument("--fallback_threshold", type=float, default=0.6)
+    parser.add_argument("--switch_penalty", type=float, default=0.01)
+    parser.add_argument("--baseline_type", choices=BASELINE_TYPES, default="fifo")
+    parser.add_argument("--action_mode", choices=ACTION_MODES, default="rule_selector")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
