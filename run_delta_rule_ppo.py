@@ -254,9 +254,14 @@ def update_model(model, optimizer, buffer: DeltaBuffer, args, device: torch.devi
 def make_run_id(args) -> str:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     suffix = uuid.uuid4().hex[:8]
-    reward_token = args.reward_mode.replace("_", "")
+    reward_tokens = {
+        "conservative_final_delta": "cfd",
+        "final_delta": "fd",
+        "step_delta": "sd",
+    }
+    reward_token = reward_tokens.get(args.reward_mode, args.reward_mode.replace("_", ""))
     return (
-        f"{METHOD}_{args.size}_{args.split}_topk{args.top_k}_ep{args.episodes}_seed{args.seed}_"
+        f"{METHOD}_{args.size}_{args.split}_k{args.top_k}_e{args.episodes}_s{args.seed}_"
         f"{args.baseline_type}_{reward_token}_{timestamp}_{suffix}"
     )
 
@@ -275,13 +280,13 @@ def prepare_run_dir(args) -> tuple[str, Path]:
 
 def make_output_paths(run_dir: Path, run_id: str) -> Dict[str, Path]:
     return {
-        "train_log": run_dir / f"train_log__{run_id}.csv",
-        "eval_last": run_dir / f"eval_last__{run_id}.csv",
-        "eval_best": run_dir / f"eval_best__{run_id}.csv",
-        "eval_summary_last": run_dir / f"eval_summary_last__{run_id}.csv",
-        "eval_summary_best": run_dir / f"eval_summary_best__{run_id}.csv",
-        "action_stats": run_dir / f"action_stats__{run_id}.csv",
-        "manifest": run_dir / f"manifest__{run_id}.json",
+        "train_log": run_dir / f"tr__{run_id}.csv",
+        "eval_last": run_dir / f"el__{run_id}.csv",
+        "eval_best": run_dir / f"eb__{run_id}.csv",
+        "eval_summary_last": run_dir / f"sl__{run_id}.csv",
+        "eval_summary_best": run_dir / f"sb__{run_id}.csv",
+        "action_stats": run_dir / f"as__{run_id}.csv",
+        "manifest": run_dir / f"mf__{run_id}.json",
         "best_checkpoint": Path("checkpoints/stage_F/delta_rule_ppo") / run_id / "best.pt",
         "last_checkpoint": Path("checkpoints/stage_F/delta_rule_ppo") / run_id / "last.pt",
     }
@@ -290,6 +295,7 @@ def make_output_paths(run_dir: Path, run_id: str) -> Dict[str, Path]:
 def write_no_overwrite(rows: Iterable[Dict], path: Path, fieldnames: List[str]) -> None:
     if path.exists():
         raise FileExistsError(f"Refusing to overwrite existing output file: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
     write_csv(rows, path, fieldnames)
 
 
@@ -493,6 +499,7 @@ def get_git_commit() -> str:
 def write_manifest(path: Path, args, run_id: str, start_time: str, end_time: str, output_paths: Dict[str, Path], device: torch.device) -> None:
     if path.exists():
         raise FileExistsError(f"Refusing to overwrite manifest: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
     manifest = {
         "run_id": run_id,
         "start_time": start_time,

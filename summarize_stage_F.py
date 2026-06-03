@@ -58,10 +58,15 @@ def read_manifest(path: Path) -> Dict:
 def collect_delta_rule_runs(result_dir: Path) -> List[Dict]:
     rows = []
     runs_dir = result_dir / "delta_rule_ppo" / "runs"
-    for manifest_path in sorted(runs_dir.glob("*/manifest__*.json")):
+    manifest_paths = [*runs_dir.glob("*/mf__*.json"), *runs_dir.glob("*/manifest__*.json")]
+    for manifest_path in sorted(manifest_paths):
         manifest = read_manifest(manifest_path)
         run_id = manifest.get("run_id", manifest_path.parent.name)
-        for summary_path in sorted(manifest_path.parent.glob("eval_summary_*__*.csv")):
+        summary_paths = [
+            *manifest_path.parent.glob("s[lb]__*.csv"),
+            *manifest_path.parent.glob("eval_summary_*__*.csv"),
+        ]
+        for summary_path in sorted(summary_paths):
             with summary_path.open("r", newline="") as f:
                 for row in csv.DictReader(f):
                     normalized = {field: row.get(field, "") for field in OUTPUT_FIELDS}
