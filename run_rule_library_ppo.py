@@ -97,7 +97,9 @@ class RuleLibraryActorCritic(nn.Module):
 
 def make_run_id(args) -> str:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"RuleLibPPO_{args.size}_{args.split}_k{args.top_k}_e{args.episodes}_s{args.seed}_{args.reward_mode}_{stamp}_{uuid.uuid4().hex[:8]}"
+    reward_tokens = {"conservative_final_delta": "cfd"}
+    reward_token = reward_tokens.get(args.reward_mode, args.reward_mode.replace("_", ""))
+    return f"RLPPO_{args.size}_{args.split}_k{args.top_k}_e{args.episodes}_s{args.seed}_{reward_token}_{stamp}_{uuid.uuid4().hex[:8]}"
 
 
 def output_paths(args, run_id: str) -> Dict[str, Path]:
@@ -109,13 +111,13 @@ def output_paths(args, run_id: str) -> Dict[str, Path]:
         "run_dir": run_dir,
         "best": ckpt_dir / "best.pt",
         "last": ckpt_dir / "last.pt",
-        "train": run_dir / f"train_log__{run_id}.csv",
-        "eval_last": run_dir / f"eval_last__{run_id}.csv",
-        "eval_best": run_dir / f"eval_best__{run_id}.csv",
-        "summary_last": run_dir / f"eval_summary_last__{run_id}.csv",
-        "summary_best": run_dir / f"eval_summary_best__{run_id}.csv",
-        "actions": run_dir / f"rule_action_stats__{run_id}.csv",
-        "manifest": run_dir / f"manifest__{run_id}.json",
+        "train": run_dir / "tr.csv",
+        "eval_last": run_dir / "el.csv",
+        "eval_best": run_dir / "eb.csv",
+        "summary_last": run_dir / "sl.csv",
+        "summary_best": run_dir / "sb.csv",
+        "actions": run_dir / "act.csv",
+        "manifest": run_dir / "mf.json",
     }
 
 
@@ -365,30 +367,6 @@ def run(args):
     write_csv(best_actions or last_actions, paths["actions"], ACTION_FIELDS)
     paths["manifest"].write_text(json.dumps({"run_id": run_id, "args": vars(args), "python_version": sys.version}, indent=2), encoding="utf-8")
     print(f"Saved Rule Library PPO run to {paths['run_dir']}")
-
-
-def make_run_id(args) -> str:
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"RuleLibPPO_{args.size}_{args.split}_k{args.top_k}_e{args.episodes}_s{args.seed}_{args.reward_mode}_{stamp}_{uuid.uuid4().hex[:8]}"
-
-
-def output_paths(args, run_id):
-    run_dir = Path(args.output_dir) / "runs" / run_id
-    ckpt_dir = Path("checkpoints/stage_F/rule_library_ppo") / run_id
-    run_dir.mkdir(parents=True, exist_ok=False)
-    ckpt_dir.mkdir(parents=True, exist_ok=False)
-    return {
-        "run_dir": run_dir,
-        "best": ckpt_dir / "best.pt",
-        "last": ckpt_dir / "last.pt",
-        "train": run_dir / f"train_log__{run_id}.csv",
-        "eval_last": run_dir / f"eval_last__{run_id}.csv",
-        "eval_best": run_dir / f"eval_best__{run_id}.csv",
-        "summary_last": run_dir / f"eval_summary_last__{run_id}.csv",
-        "summary_best": run_dir / f"eval_summary_best__{run_id}.csv",
-        "actions": run_dir / f"rule_action_stats__{run_id}.csv",
-        "manifest": run_dir / f"manifest__{run_id}.json",
-    }
 
 
 def main():
