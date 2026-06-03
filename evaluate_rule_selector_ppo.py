@@ -74,8 +74,8 @@ def _ranker_select(model, env, candidates: List[str]) -> str:
 
 def _load_rule_selector_model(path: str | None, state_dim: int, action_dim: int):
     if not path:
-        raise ValueError("rule_selector_ppo requires --checkpoint_path.")
-    checkpoint_path = Path(path)
+        raise ValueError("rule_selector_ppo requires --checkpoint_path or --ppo_model_path.")
+    checkpoint_path = _resolve_ppo_checkpoint_path(path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Missing Rule-Selector PPO checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -83,6 +83,33 @@ def _load_rule_selector_model(path: str | None, state_dim: int, action_dim: int)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     return model
+
+
+def _resolve_ppo_checkpoint_path(path: str | Path) -> Path:
+    """Resolve explicit or timestamp-suffixed Stage F checkpoint paths."""
+
+    checkpoint_path = Path(path)
+    if checkpoint_path.exists():
+        return checkpoint_path
+
+    if checkpoint_path.name != "best.pt":
+        return checkpoint_path
+
+    run_dir = checkpoint_path.parent
+    parent = run_dir.parent
+    if not parent.exists():
+        return checkpoint_path
+
+    candidates = sorted(
+        parent.glob(f"{run_dir.name}_*/best.pt"),
+        key=lambda candidate: (candidate.stat().st_mtime, candidate.as_posix()),
+        reverse=True,
+    )
+    if candidates:
+        resolved = candidates[0]
+        print(f"Resolved PPO checkpoint path: {checkpoint_path} -> {resolved}")
+        return resolved
+    return checkpoint_path
 
 
 def run_method(instance, method: str, top_k: int, seed: int, ranker_model=None, ppo_model=None, args=None) -> Dict:
@@ -100,7 +127,7 @@ def run_method(instance, method: str, top_k: int, seed: int, ranker_model=None, 
         state = env.reset(instance)
         model = ppo_model
         if model is None:
-            model = _load_rule_selector_model(args.checkpoint_path, len(state), env.action_dim)
+            model = _load_rule_selector_model(args.resolved_ppo_model_path, len(state), env.action_dim)
         while not env.env.is_done():
             action, _, _ = select_action(model, state, env.action_mask(), torch.device("cpu"), greedy=True)
             state, _, _, _ = env.step(action)
@@ -149,9 +176,9 @@ def evaluate(args) -> List[Dict]:
 
     ranker_model = load_checkpoint(args.mlp_soft_model_path) if args.mlp_soft_model_path and Path(args.mlp_soft_model_path).exists() else None
     ppo_model = None
-    if "rule_selector_ppo" in args.methods and args.checkpoint_path:
+    if "rule_selector_ppo" in args.methods and args.resolved_ppo_model_path:
         probe = RuleSelectorEnv(instances[0], top_k=args.top_k, mlp_soft_model_path=args.mlp_soft_model_path)
-        ppo_model = _load_rule_selector_model(args.checkpoint_path, len(probe.reset(instances[0])), probe.action_dim)
+        ppo_model = _load_rule_selector_model(args.resolved_ppo_model_path, len(probe.reset(instances[0])), probe.action_dim)
 
     rows = []
     for method in args.methods:
@@ -245,6 +272,7 @@ def main() -> None:
     parser.add_argument("--top_k", type=int, default=5)
     parser.add_argument("--run_id", default=None)
     parser.add_argument("--checkpoint_path", default=None)
+    parser.add_argument("--ppo_model_path", default=None, help="Alias for --checkpoint_path.")
     parser.add_argument("--mlp_soft_model_path", default=None)
     parser.add_argument("--mlp_pairwise_model_path", default=None)
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=METHODS)
@@ -253,6 +281,7 @@ def main() -> None:
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     args.run_id = make_run_id(args.run_id)
+    args.resolved_ppo_model_path = args.checkpoint_path or args.ppo_model_path
 
     rows = evaluate(args)
     tokens = [args.size, args.split, f"topk{args.top_k}", f"runid{args.run_id}"]
