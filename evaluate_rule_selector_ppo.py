@@ -143,6 +143,7 @@ def run_method(instance, method: str, top_k: int, seed: int, ranker_model=None, 
             fallback_threshold=args.fallback_threshold if args else 0.6,
             switch_penalty=args.switch_penalty if args else 0.01,
             baseline_type=args.baseline_type if args else "fifo",
+            include_pairwise_ranker=args.include_pairwise_ranker if args else False,
         )
         state = env.reset(instance)
         model = ppo_model
@@ -237,6 +238,7 @@ def evaluate(args) -> List[Dict]:
             fallback_threshold=args.fallback_threshold,
             switch_penalty=args.switch_penalty,
             baseline_type=args.baseline_type,
+            include_pairwise_ranker=args.include_pairwise_ranker,
         )
         ppo_model = _load_rule_selector_model(args.resolved_ppo_model_path, len(probe.reset(instances[0])), probe.action_dim)
 
@@ -373,6 +375,7 @@ def main() -> None:
     parser.add_argument("--switch_penalty", type=float, default=0.01)
     parser.add_argument("--baseline_type", choices=BASELINE_TYPES, default="fifo")
     parser.add_argument("--action_mode", choices=ACTION_MODES, default="rule_selector")
+    parser.add_argument("--include_pairwise_ranker", action="store_true")
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=METHODS)
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)

@@ -56,6 +56,7 @@ class RuleSelectorEnv:
         fallback_threshold: float = 0.6,
         switch_penalty: float = 0.01,
         baseline_type: str = "fifo",
+        include_pairwise_ranker: bool = False,
         seed: int = 42,
     ):
         if action_mode not in ACTION_MODES:
@@ -73,9 +74,13 @@ class RuleSelectorEnv:
         self.fallback_threshold = float(fallback_threshold)
         self.switch_penalty = float(switch_penalty)
         self.baseline_type = baseline_type
+        self.include_pairwise_ranker = bool(include_pairwise_ranker)
         self.mlp_soft_model = self._try_load_model(mlp_soft_model_path)
         self.mlp_pairwise_model = self._try_load_model(mlp_pairwise_model_path)
-        self.rule_names = list(DELTA_RULES if action_mode == "delta_rule" else ALL_RULES)
+        if action_mode == "delta_rule":
+            self.rule_names = list(DELTA_RULES if self.include_pairwise_ranker else DELTA_RULES[:-1])
+        else:
+            self.rule_names = list(ALL_RULES)
         self.env = RollingSchedulingEnv(instance)
         self.instance = self.env.instance
         self.process_types = process_types_for_instance(self.instance)
@@ -192,11 +197,14 @@ class RuleSelectorEnv:
     def diagnostics(self) -> Dict[str, float | Dict[str, float]]:
         executed = self.rule_distribution()
         raw = self.raw_rule_distribution()
-        total = max(1, sum(self.rule_counts.values()))
+        total_decisions = sum(self.rule_counts.values())
+        total = max(1, total_decisions)
         ranker_ratio = sum(value for rule, value in executed.items() if self._is_ranker_action(rule))
         return {
             "ppo_raw_rule_distribution": raw,
             "executed_rule_distribution": executed,
+            "executed_rule_counts": {rule: float(self.rule_counts[rule]) for rule in self.rule_names},
+            "total_decisions": float(total_decisions),
             "rule_ranker_ratio": ranker_ratio,
             "rule_non_ranker_ratio": max(0.0, 1.0 - ranker_ratio),
             "fallback_count": float(self.fallback_count),

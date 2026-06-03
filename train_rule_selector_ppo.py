@@ -164,6 +164,7 @@ def evaluate_validation(model, instances, args, device: torch.device, max_eval_i
             fallback_threshold=args.fallback_threshold,
             switch_penalty=args.switch_penalty,
             baseline_type=args.baseline_type,
+            include_pairwise_ranker=args.include_pairwise_ranker,
         )
         state = env.reset(instance)
         while not env.env.is_done():
@@ -224,6 +225,7 @@ def train(args) -> None:
         fallback_threshold=args.fallback_threshold,
         switch_penalty=args.switch_penalty,
         baseline_type=args.baseline_type,
+        include_pairwise_ranker=args.include_pairwise_ranker,
     )
     state_dim = len(probe_env.reset(train_instances[0]))
     action_dim = probe_env.action_dim
@@ -292,6 +294,7 @@ def train(args) -> None:
                 fallback_threshold=args.fallback_threshold,
                 switch_penalty=args.switch_penalty,
                 baseline_type=args.baseline_type,
+                include_pairwise_ranker=args.include_pairwise_ranker,
                 seed=args.seed + episode,
             )
             state = env.reset(instance)
@@ -412,6 +415,7 @@ def main() -> None:
     parser.add_argument("--switch_penalty", type=float, default=0.01)
     parser.add_argument("--baseline_type", choices=BASELINE_TYPES, default="fifo")
     parser.add_argument("--action_mode", choices=ACTION_MODES, default="rule_selector")
+    parser.add_argument("--include_pairwise_ranker", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
