@@ -6,6 +6,7 @@ import argparse
 import time
 from typing import Dict, List
 
+from candidate_generator import fifo_ranked
 from instance_manager import SIZES, SPLITS, ensure_fixed_dataset, load_fixed_instances
 from src.baselines.heuristics import choose_split_num
 from src.envs.rolling_scheduling_env import RollingSchedulingEnv
@@ -22,7 +23,17 @@ from stage_c_utils import (
 from utils.experiment_io import progress_iter
 
 
-def generate_records_for_instance(instance, top_k: int, oracle_rollout_policy: str = "fifo") -> List[Dict]:
+def _fifo_candidate_index(env, candidates: List[str]) -> int:
+    fifo_order = {job_id: idx for idx, job_id in enumerate(fifo_ranked(env))}
+    return min(range(len(candidates)), key=lambda idx: (fifo_order.get(candidates[idx], 10**9), candidates[idx]))
+
+
+def generate_records_for_instance(
+    instance,
+    top_k: int,
+    oracle_rollout_policy: str = "fifo",
+    improvement_epsilon: float = 0.0,
+) -> List[Dict]:
     env = RollingSchedulingEnv(instance)
     env.reset(instance)
     records: List[Dict] = []
@@ -39,6 +50,11 @@ def generate_records_for_instance(instance, top_k: int, oracle_rollout_policy: s
         best_idx = best_candidate_index(cmax_values)
         best_job = candidates[best_idx]
         baseline_job = fifo_first(env)
+        fifo_idx = _fifo_candidate_index(env, candidates)
+        fifo_job = candidates[fifo_idx]
+        fifo_rollout_cmax = float(cmax_values[fifo_idx])
+        oracle_best_cmax = float(cmax_values[best_idx])
+        improvement_over_fifo = max(0.0, fifo_rollout_cmax - oracle_best_cmax)
 
         records.append(
             {
@@ -53,6 +69,14 @@ def generate_records_for_instance(instance, top_k: int, oracle_rollout_policy: s
                 "best_candidate_index": best_idx,
                 "best_job_id": best_job,
                 "oracle_cmax_per_candidate": [float(value) for value in cmax_values],
+                "fifo_candidate_index": fifo_idx,
+                "fifo_job_id": fifo_job,
+                "fifo_rollout_cmax": fifo_rollout_cmax,
+                "oracle_best_cmax": oracle_best_cmax,
+                "oracle_best_index": best_idx,
+                "oracle_best_job_id": best_job,
+                "improvement_over_fifo": improvement_over_fifo,
+                "is_improvement_state": 1 if improvement_over_fifo > improvement_epsilon else 0,
                 "baseline_selected_job": baseline_job,
                 "method_used": "hybrid_topk_oracle_debug",
                 "oracle_rollout_policy": oracle_rollout_policy,
@@ -71,6 +95,7 @@ def generate_dataset(
     top_k: int = 5,
     max_instances: int | None = None,
     oracle_rollout_policy: str = "fifo",
+    improvement_epsilon: float = 0.0,
     output_dir: str = "data/ranker_dataset/",
 ) -> List[Dict]:
     ensure_fixed_dataset([size], [split])
@@ -82,7 +107,12 @@ def generate_dataset(
     started = time.perf_counter()
     desc = f"ranker-data {size}/{split} topk{top_k}"
     for idx, instance in enumerate(progress_iter(instances, desc=desc, total=len(instances)), start=1):
-        instance_records = generate_records_for_instance(instance, top_k, oracle_rollout_policy)
+        instance_records = generate_records_for_instance(
+            instance,
+            top_k,
+            oracle_rollout_policy=oracle_rollout_policy,
+            improvement_epsilon=improvement_epsilon,
+        )
         records.extend(instance_records)
         print(
             f"[{idx}/{len(instances)}] {getattr(instance, 'instance_id', instance.name)} "
@@ -102,6 +132,7 @@ def main() -> None:
     parser.add_argument("--top_k", type=int, default=5)
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--oracle_rollout_policy", choices=["fifo", "lookahead"], default="fifo")
+    parser.add_argument("--improvement_epsilon", type=float, default=0.0)
     parser.add_argument("--output_dir", default="data/ranker_dataset/")
     args = parser.parse_args()
 
@@ -111,6 +142,7 @@ def main() -> None:
         top_k=args.top_k,
         max_instances=args.max_instances,
         oracle_rollout_policy=args.oracle_rollout_policy,
+        improvement_epsilon=args.improvement_epsilon,
         output_dir=args.output_dir,
     )
 
