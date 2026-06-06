@@ -35,7 +35,13 @@ LABEL_FIELDS = ["rule_name", "label_count", "label_ratio", "valid_count", "valid
 
 def make_run_id(args) -> str:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"RuleLibBCData_{args.size}_{args.split}_k{args.top_k}_{args.label_mode}_{stamp}_{uuid.uuid4().hex[:8]}"
+    label_tokens = {
+        "one_step_cmax": "osc",
+        "one_step_ect": "ose",
+        "conservative_margin": "cm",
+    }
+    label_token = label_tokens.get(args.label_mode, args.label_mode.replace("_", ""))
+    return f"RLBData_{args.size}_{args.split}_k{args.top_k}_{label_token}_{stamp}_{uuid.uuid4().hex[:8]}"
 
 
 def output_paths(args, run_id: str) -> Dict[str, Path]:
@@ -43,10 +49,10 @@ def output_paths(args, run_id: str) -> Dict[str, Path]:
     run_dir.mkdir(parents=True, exist_ok=False)
     return {
         "run_dir": run_dir,
-        "dataset": run_dir / f"dataset__{run_id}.pt",
-        "preview": run_dir / f"dataset_preview__{run_id}.csv",
-        "label_stats": run_dir / f"label_stats__{run_id}.csv",
-        "manifest": run_dir / f"manifest__{run_id}.json",
+        "dataset": run_dir / "dataset.pt",
+        "preview": run_dir / "preview.csv",
+        "label_stats": run_dir / "label_stats.csv",
+        "manifest": run_dir / "manifest.json",
     }
 
 
