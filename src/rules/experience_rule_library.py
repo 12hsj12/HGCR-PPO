@@ -133,28 +133,100 @@ class ExperienceRuleLibrary:
         trial.step((job_id, choose_split_num(trial, job_id)))
         return float(trial.current_cmax)
 
-    def state_features(self, env, candidates: Sequence[str], recommendations: Sequence[RuleRecommendation]) -> List[float]:
+    def state_features(
+        self,
+        env,
+        candidates: Sequence[str],
+        recommendations: Sequence[RuleRecommendation],
+        use_rule_features: bool = True,
+        active_rule_count: int | None = None,
+    ) -> List[float]:
         candidate_count = len(candidates)
         total_jobs = max(1, len(env.instance.jobs))
         machine_times = list(env.machine_available_time.values()) or [0.0]
+        time_scale = max(1.0, max(machine_times + [env.current_cmax]))
         base = [
-            float(env.current_cmax) / max(1.0, max(machine_times + [env.current_cmax])),
+            float(env.current_cmax) / time_scale,
             len(env.unscheduled_jobs) / total_jobs,
             candidate_count / max(1, candidate_count),
-            float(np.mean(machine_times)),
-            float(np.std(machine_times)),
+            float(np.mean(machine_times)) / time_scale,
+            float(np.std(machine_times)) / time_scale,
         ]
+        if not use_rule_features:
+            return [float(value) for value in base]
+
         rec_features = []
-        max_proxy = max([rec.score_or_proxy for rec in recommendations if rec.is_valid] or [1.0])
-        for rec in recommendations:
+        active_recs = list(recommendations[: active_rule_count or len(recommendations)])
+        base_score = recommendations[0].score_or_proxy if recommendations and recommendations[0].is_valid else 0.0
+        proxy_values = [rec.score_or_proxy for rec in active_recs if rec.is_valid]
+        max_proxy = max(proxy_values or [1.0])
+        min_machine = float(np.min(machine_times))
+        max_machine = float(np.max(machine_times))
+        mean_machine = float(np.mean(machine_times))
+        std_machine = float(np.std(machine_times))
+        for rec in active_recs:
+            job_features = self.job_rule_features(env, rec.job_id, rec.score_or_proxy, base_score) if rec.is_valid else {}
             rec_features.extend(
                 [
                     1.0 if rec.is_valid else 0.0,
                     rec.candidate_index / max(1, candidate_count - 1) if rec.candidate_index >= 0 else 0.0,
                     rec.score_or_proxy / max(1.0, max_proxy) if rec.is_valid else 0.0,
+                    job_features.get("score_delta_to_baseline", 0.0),
+                    job_features.get("processing_time", 0.0),
+                    job_features.get("estimated_completion_time", 0.0),
+                    job_features.get("earliest_machine_completion_time", 0.0),
+                    len(env.unscheduled_jobs) / total_jobs,
+                    mean_machine / time_scale,
+                    std_machine / time_scale,
+                    min_machine / time_scale,
+                    max_machine / time_scale,
+                    job_features.get("process_code", 0.0),
                 ]
             )
         return [float(value) for value in [*base, *rec_features]]
+
+    def job_rule_features(self, env, job_id: str | None, proxy_score: float, baseline_score: float) -> Dict[str, float]:
+        if job_id is None:
+            return {}
+        job = env.instance.jobs.get(job_id) if hasattr(env.instance.jobs, "get") else None
+        machine_times = list(env.machine_available_time.values()) or [0.0]
+        time_scale = max(1.0, max(machine_times + [env.current_cmax, proxy_score, baseline_score]))
+        proc_times = self._job_processing_times(job)
+        min_proc = min(proc_times) if proc_times else 0.0
+        min_available = min(machine_times) if machine_times else 0.0
+        process_code = float(self._process_code(job)) / 10.0
+        return {
+            "score_delta_to_baseline": (float(proxy_score) - float(baseline_score)) / time_scale,
+            "processing_time": float(min_proc) / time_scale,
+            "estimated_completion_time": (float(min_available) + float(min_proc)) / time_scale,
+            "earliest_machine_completion_time": float(min_available) / time_scale,
+            "process_code": process_code,
+        }
+
+    @staticmethod
+    def _job_processing_times(job) -> List[float]:
+        if job is None:
+            return []
+        values = []
+        for attr in ("processing_time", "processing_times", "machine_processing_times"):
+            raw = getattr(job, attr, None)
+            if isinstance(raw, dict):
+                values.extend(float(v) for v in raw.values() if v is not None)
+            elif isinstance(raw, (list, tuple)):
+                values.extend(float(v) for v in raw if v is not None)
+            elif isinstance(raw, (int, float)):
+                values.append(float(raw))
+        return values
+
+    @staticmethod
+    def _process_code(job) -> int:
+        if job is None:
+            return 0
+        raw = getattr(job, "process_type", getattr(job, "operation_type", ""))
+        if isinstance(raw, (int, float)):
+            return int(raw)
+        mapping = {"slitting": 1, "cutting": 2, "composite": 3, "zongjian": 1, "hengqie": 2, "fuhejian": 3}
+        return mapping.get(str(raw).lower(), 0)
 
     def _ranker_job(self, env, candidates: Sequence[str]) -> str | None:
         if self.ranker_model is None or not candidates:

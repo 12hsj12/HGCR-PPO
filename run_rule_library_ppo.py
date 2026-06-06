@@ -33,10 +33,30 @@ from utils.experiment_io import progress_iter, write_csv
 
 
 METHOD = "RuleLibraryPPO"
-TRAIN_FIELDS = ["episode", "reward", "final_cmax", "baseline_cmax", "delta_improvement", "policy_loss", "value_loss", "entropy", "kl_to_bc", "eval_delta_improvement_mean", "is_best"]
+TRAIN_FIELDS = [
+    "run_id",
+    "episode",
+    "reward",
+    "step_reward_mean",
+    "final_reward",
+    "total_reward",
+    "final_cmax",
+    "baseline_cmax",
+    "delta_improvement",
+    "policy_loss",
+    "value_loss",
+    "entropy",
+    "kl_to_bc",
+    "base_rule_ratio",
+    "non_base_rule_ratio",
+    "eval_Cmax_mean",
+    "eval_delta_improvement_mean",
+    "is_best",
+]
 EVAL_FIELDS = ["run_id", "method", "checkpoint_type", "instance_id", "size", "split", "top_k", "episodes", "seed", "final_cmax", "baseline_Cmax", "delta_improvement", "normalized_delta_improvement", "base_rule_ratio", "non_base_rule_ratio", "fallback_count", "is_valid_schedule"]
 SUMMARY_FIELDS = ["run_id", "method", "checkpoint_type", "size", "split", "top_k", "episodes", "seed", "Cmax_mean", "Cmax_std", "baseline_Cmax_mean", "delta_improvement_mean", "delta_improvement_std", "normalized_delta_improvement_mean", "base_rule_ratio_mean", "non_base_rule_ratio_mean", "fallback_count_mean", "valid_schedule_rate"]
 ACTION_FIELDS = ["rule_name", "rule_count", "rule_ratio", "mean_proxy_score", "fallback_count", "fallback_ratio"]
+REWARD_FIELDS = ["episode", "step_reward_sum", "final_reward", "override_penalty_sum", "total_reward", "Cmax_baseline", "Cmax_ppo", "delta_improvement"]
 
 
 @dataclass
@@ -95,29 +115,40 @@ class RuleLibraryActorCritic(nn.Module):
         return torch.distributions.Categorical(logits=logits.masked_fill(~masks.bool(), -1e9)), value
 
 
+def method_name(args) -> str:
+    return getattr(args, "method", METHOD)
+
+
+def active_rule_names(args) -> List[str]:
+    return RULE_NAMES[:5] if getattr(args, "disable_min_cmax_action", False) else list(RULE_NAMES)
+
+
 def make_run_id(args) -> str:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    reward_tokens = {"conservative_final_delta": "cfd"}
+    prefix = "HGCR" if method_name(args) == "HGCR-PPO" else "RLPPO"
+    reward_tokens = {"conservative_final_delta": "cfd", "step_plus_final_delta": "spfd"}
     reward_token = reward_tokens.get(args.reward_mode, args.reward_mode.replace("_", ""))
-    return f"RLPPO_{args.size}_{args.split}_k{args.top_k}_e{args.episodes}_s{args.seed}_{reward_token}_{stamp}_{uuid.uuid4().hex[:8]}"
+    return f"{prefix}_{args.size}_{args.split}_k{args.top_k}_e{args.episodes}_s{args.seed}_{reward_token}_{stamp}_{uuid.uuid4().hex[:8]}"
 
 
 def output_paths(args, run_id: str) -> Dict[str, Path]:
     run_dir = Path(args.output_dir) / "runs" / run_id
-    ckpt_dir = Path("checkpoints/stage_F/rule_library_ppo") / run_id
+    ckpt_root = "checkpoints/stage_F/hgcr_ppo" if method_name(args) == "HGCR-PPO" else "checkpoints/stage_F/rule_library_ppo"
+    ckpt_dir = Path(ckpt_root) / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     ckpt_dir.mkdir(parents=True, exist_ok=False)
     return {
         "run_dir": run_dir,
         "best": ckpt_dir / "best.pt",
         "last": ckpt_dir / "last.pt",
-        "train": run_dir / "tr.csv",
-        "eval_last": run_dir / "el.csv",
-        "eval_best": run_dir / "eb.csv",
-        "summary_last": run_dir / "sl.csv",
-        "summary_best": run_dir / "sb.csv",
-        "actions": run_dir / "act.csv",
-        "manifest": run_dir / "mf.json",
+        "train": run_dir / f"train_log__{run_id}.csv",
+        "eval_last": run_dir / f"eval_last__{run_id}.csv",
+        "eval_best": run_dir / f"eval_best__{run_id}.csv",
+        "summary_last": run_dir / f"eval_summary_last__{run_id}.csv",
+        "summary_best": run_dir / f"eval_summary_best__{run_id}.csv",
+        "actions": run_dir / f"rule_action_stats__{run_id}.csv",
+        "rewards": run_dir / f"reward_components__{run_id}.csv",
+        "manifest": run_dir / f"manifest__{run_id}.json",
     }
 
 
@@ -137,11 +168,14 @@ def init_from_bc(model, bc_model: RuleBCSelector | None, keep_base_bias: float) 
             model.actor_head.bias.zero_()
             model.actor_head.bias[0] = float(keep_base_bias)
         return
-    # Architecture differs slightly; copy the final classifier when dimensions match.
+    # Architecture differs slightly; copy the final classifier rows that match.
     with torch.no_grad():
-        if bc_model.net[-1].weight.shape == model.actor_head.weight.shape:
-            model.actor_head.weight.copy_(bc_model.net[-1].weight)
-            model.actor_head.bias.copy_(bc_model.net[-1].bias)
+        rows = min(bc_model.net[-1].weight.shape[0], model.actor_head.weight.shape[0])
+        cols = min(bc_model.net[-1].weight.shape[1], model.actor_head.weight.shape[1])
+        model.actor_head.weight[:rows, :cols].copy_(bc_model.net[-1].weight[:rows, :cols])
+        model.actor_head.bias[:rows].copy_(bc_model.net[-1].bias[:rows])
+        if rows > 0:
+            model.actor_head.bias[0] += float(keep_base_bias)
 
 
 def select_action(model, state, mask, device, greedy=False):
@@ -164,6 +198,15 @@ def baseline_cmax(instance, args, library) -> float:
     return float(env.current_cmax)
 
 
+def compute_step_reward(args, recs, action: int) -> tuple[float, float, float]:
+    base_score = recs[0].score_or_proxy if recs and recs[0].is_valid else 0.0
+    selected_score = recs[action].score_or_proxy if 0 <= action < len(recs) and recs[action].is_valid else base_score
+    raw = float(base_score) - float(selected_score)
+    normalized = raw / max(abs(float(base_score)), 1e-8)
+    penalty = float(args.override_penalty) if int(action) != 0 else 0.0
+    return raw, normalized * float(args.step_reward_weight) - penalty, penalty
+
+
 def run_episode(model, instance, args, library, device, train_mode: bool):
     env = RollingSchedulingEnv(instance)
     env.reset(instance)
@@ -171,28 +214,53 @@ def run_episode(model, instance, args, library, device, train_mode: bool):
     counts = Counter()
     proxy_sum = Counter()
     fallback = 0
+    step_reward_sum = 0.0
+    raw_step_reward_sum = 0.0
+    override_penalty_sum = 0.0
     while not env.is_done():
         candidates = generate_candidates(env, candidate_mode="hybrid_topk", top_k=args.top_k, fallback_to_all=True)
         recs = library.recommend(env, candidates)
-        mask = library.action_mask(recs)
-        state = library.state_features(env, candidates, recs)
+        active_count = len(active_rule_names(args))
+        active_recs = recs[:active_count]
+        mask = library.action_mask(active_recs)
+        state = library.state_features(env, candidates, recs, use_rule_features=args.use_rule_features, active_rule_count=active_count)
         action, logprob, value = select_action(model, state, mask, device, greedy=not train_mode)
         job_id, executed_rule = library.choose_job_or_fallback(recs, action)
         if executed_rule != action:
             fallback += 1
         counts[RULE_NAMES[executed_rule]] += 1
         proxy_sum[RULE_NAMES[executed_rule]] += recs[executed_rule].score_or_proxy
+        raw_step, step_reward, step_penalty = compute_step_reward(args, recs, executed_rule)
+        raw_step_reward_sum += raw_step
+        step_reward_sum += step_reward
+        override_penalty_sum += step_penalty
         env.step((job_id, choose_split_num(env, job_id)))
-        buffer.add(state, action, mask, logprob, 0.0, value, env.is_done())
+        buffer.add(state, action, mask, logprob, step_reward if args.reward_mode == "step_plus_final_delta" else 0.0, value, env.is_done())
     base = baseline_cmax(instance, args, library)
     final = float(env.current_cmax)
     non_base_ratio = 1.0 - counts[RULE_NAMES[0]] / max(1, sum(counts.values()))
     delta = base - final
     normalized = delta / max(base, 1e-8) * 100.0
-    reward = normalized - args.override_penalty * non_base_ratio
+    if args.reward_mode == "step_plus_final_delta":
+        final_reward = delta * float(args.final_reward_weight)
+        reward = step_reward_sum + final_reward
+    else:
+        final_reward = normalized - args.override_penalty * non_base_ratio
+        reward = final_reward
     if buffer.rewards:
-        buffer.rewards[-1] = reward
-    return env, buffer, counts, proxy_sum, fallback, base, delta, normalized, reward
+        buffer.rewards[-1] += final_reward
+    reward_components = {
+        "step_reward_sum": step_reward_sum,
+        "raw_step_reward_sum": raw_step_reward_sum,
+        "final_reward": final_reward,
+        "override_penalty_sum": override_penalty_sum,
+        "total_reward": reward,
+        "Cmax_baseline": base,
+        "Cmax_ppo": final,
+        "delta_improvement": delta,
+        "step_reward_mean": step_reward_sum / max(1, sum(counts.values())),
+    }
+    return env, buffer, counts, proxy_sum, fallback, base, delta, normalized, reward, reward_components
 
 
 def update(model, bc_model, optimizer, buffer, args, device, freeze_actor: bool):
@@ -207,9 +275,9 @@ def update(model, bc_model, optimizer, buffer, args, device, freeze_actor: bool)
         value_loss = F.smooth_l1_loss(values, batch["returns"])
         entropy = dist.entropy().mean()
         kl = torch.zeros((), device=device)
-        if bc_model is not None:
+        if bc_model is not None and getattr(bc_model.net[0], "in_features", batch["states"].shape[1]) == batch["states"].shape[1]:
             with torch.no_grad():
-                bc_logits = bc_model(batch["states"]).masked_fill(~batch["masks"], -1e9)
+                bc_logits = bc_model(batch["states"])[:, : batch["masks"].shape[1]].masked_fill(~batch["masks"], -1e9)
                 bc_probs = torch.softmax(bc_logits, dim=1)
             kl = torch.distributions.kl_divergence(torch.distributions.Categorical(probs=bc_probs), dist).mean()
         if freeze_actor:
@@ -233,14 +301,14 @@ def evaluate_policy(model, instances, args, library, device, run_id, checkpoint_
     proxy_sums = Counter()
     fallback_total = 0
     for instance in instances:
-        env, _, counts, proxy_sum, fallback, base, delta, normalized, _ = run_episode(model, instance, args, library, device, False)
+        env, _, counts, proxy_sum, fallback, base, delta, normalized, _, _ = run_episode(model, instance, args, library, device, False)
         metrics = compute_metrics(env)
         valid = validate_schedule(env, instance)
         total = max(1, sum(counts.values()))
         rows.append(
             {
                 "run_id": run_id,
-                "method": METHOD,
+                "method": method_name(args),
                 "checkpoint_type": checkpoint_type,
                 "instance_id": getattr(instance, "instance_id", getattr(instance, "name", "")),
                 "size": args.size,
@@ -284,7 +352,7 @@ def summarize(rows, args, run_id, checkpoint_type):
     return [
         {
             "run_id": run_id,
-            "method": METHOD,
+            "method": method_name(args),
             "checkpoint_type": checkpoint_type,
             "size": args.size,
             "split": args.split,
@@ -325,8 +393,16 @@ def run(args):
     probe_env.reset(instances[0])
     probe_candidates = generate_candidates(probe_env, candidate_mode="hybrid_topk", top_k=args.top_k, fallback_to_all=True)
     probe_recs = library.recommend(probe_env, probe_candidates)
-    state_dim = len(library.state_features(probe_env, probe_candidates, probe_recs))
-    model = RuleLibraryActorCritic(state_dim, len(RULE_NAMES)).to(device)
+    state_dim = len(
+        library.state_features(
+            probe_env,
+            probe_candidates,
+            probe_recs,
+            use_rule_features=args.use_rule_features,
+            active_rule_count=len(active_rule_names(args)),
+        )
+    )
+    model = RuleLibraryActorCritic(state_dim, len(active_rule_names(args))).to(device)
     bc_model = load_bc_model(args.bc_init_ckpt, state_dim, device)
     init_from_bc(model, bc_model, args.keep_base_bias)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
@@ -334,22 +410,53 @@ def run(args):
     run_id = make_run_id(args)
     paths = output_paths(args, run_id)
     train_rows = []
+    reward_rows = []
     best_score = -float("inf")
     best_state = None
+    bad_evals = 0
     for episode in progress_iter(range(1, args.episodes + 1), desc="rule-library-ppo train", total=args.episodes):
         instance = instances[(episode - 1) % len(instances)]
-        _, buffer, _, _, _, base, delta, _, reward = run_episode(model, instance, args, library, device, True)
+        _, buffer, counts, _, _, base, delta, _, reward, reward_components = run_episode(model, instance, args, library, device, True)
         stats = update(model, bc_model, optimizer, buffer, args, device, episode <= args.freeze_actor_episodes)
         eval_delta = ""
+        eval_cmax = ""
         is_best = False
         if episode % max(1, args.eval_interval) == 0 or episode == args.episodes:
             eval_rows, _ = evaluate_policy(model, instances, args, library, device, run_id, "interval")
-            eval_delta = summarize(eval_rows, args, run_id, "interval")[0]["delta_improvement_mean"]
+            eval_summary = summarize(eval_rows, args, run_id, "interval")[0]
+            eval_delta = eval_summary["delta_improvement_mean"]
+            eval_cmax = eval_summary["Cmax_mean"]
             if float(eval_delta) > best_score:
                 best_score = float(eval_delta)
                 best_state = deepcopy(model.state_dict())
                 is_best = True
-        train_rows.append({"episode": episode, "reward": reward, "final_cmax": base - delta, "baseline_cmax": base, "delta_improvement": delta, "eval_delta_improvement_mean": eval_delta, "is_best": is_best, **stats})
+                bad_evals = 0
+            else:
+                bad_evals += 1
+        total_decisions = max(1, sum(counts.values()))
+        train_rows.append(
+            {
+                "run_id": run_id,
+                "episode": episode,
+                "reward": reward,
+                "step_reward_mean": reward_components["step_reward_mean"],
+                "final_reward": reward_components["final_reward"],
+                "total_reward": reward_components["total_reward"],
+                "final_cmax": base - delta,
+                "baseline_cmax": base,
+                "delta_improvement": delta,
+                "base_rule_ratio": counts[RULE_NAMES[0]] / total_decisions,
+                "non_base_rule_ratio": 1.0 - counts[RULE_NAMES[0]] / total_decisions,
+                "eval_Cmax_mean": eval_cmax,
+                "eval_delta_improvement_mean": eval_delta,
+                "is_best": is_best,
+                **stats,
+            }
+        )
+        reward_rows.append({"episode": episode, **{key: reward_components[key] for key in REWARD_FIELDS if key != "episode"}})
+        if args.early_stop and bad_evals >= args.early_stop_patience:
+            print(f"Early stop at episode {episode}: no eval improvement for {bad_evals} eval checks.")
+            break
     last_state = deepcopy(model.state_dict())
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -365,7 +472,23 @@ def run(args):
     write_csv(summarize(last_rows, args, run_id, "last"), paths["summary_last"], SUMMARY_FIELDS)
     write_csv(summarize(best_rows, args, run_id, "best"), paths["summary_best"], SUMMARY_FIELDS)
     write_csv(best_actions or last_actions, paths["actions"], ACTION_FIELDS)
-    paths["manifest"].write_text(json.dumps({"run_id": run_id, "args": vars(args), "python_version": sys.version}, indent=2), encoding="utf-8")
+    write_csv(reward_rows, paths["rewards"], REWARD_FIELDS)
+    paths["manifest"].write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "method": method_name(args),
+                "args": vars(args),
+                "active_rule_names": active_rule_names(args),
+                "state_dim": state_dim,
+                "best_score": best_score,
+                "output_files": {key: str(value) for key, value in paths.items() if key != "run_dir"},
+                "python_version": sys.version,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(f"Saved Rule Library PPO run to {paths['run_dir']}")
 
 
@@ -379,7 +502,12 @@ def main():
     parser.add_argument("--ranker_ckpt", default="checkpoints/stage_C/mlp_ranker/small_topk5_soft_ce/best.pt")
     parser.add_argument("--bc_init_ckpt", default=None)
     parser.add_argument("--baseline_method", choices=["mlp_ranker_soft_ce"], default="mlp_ranker_soft_ce")
-    parser.add_argument("--reward_mode", choices=["conservative_final_delta"], default="conservative_final_delta")
+    parser.add_argument("--reward_mode", choices=["conservative_final_delta", "step_plus_final_delta"], default="conservative_final_delta")
+    parser.add_argument("--method", default=METHOD)
+    parser.add_argument("--use_rule_features", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--disable_min_cmax_action", action="store_true")
+    parser.add_argument("--final_reward_weight", type=float, default=1.0)
+    parser.add_argument("--step_reward_weight", type=float, default=1.0)
     parser.add_argument("--override_penalty", type=float, default=0.03)
     parser.add_argument("--keep_base_bias", type=float, default=2.0)
     parser.add_argument("--eval_interval", type=int, default=50)
@@ -394,6 +522,8 @@ def main():
     parser.add_argument("--value_coef", type=float, default=0.5)
     parser.add_argument("--entropy_coef", type=float, default=0.01)
     parser.add_argument("--update_epochs", type=int, default=4)
+    parser.add_argument("--early_stop", action="store_true")
+    parser.add_argument("--early_stop_patience", type=int, default=5)
     args = parser.parse_args()
     run(args)
 
