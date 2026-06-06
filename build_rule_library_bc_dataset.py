@@ -18,7 +18,7 @@ from candidate_generator import generate_candidates
 from instance_manager import SIZES, SPLITS, ensure_fixed_dataset, load_fixed_instances
 from src.baselines.heuristics import choose_split_num
 from src.envs.rolling_scheduling_env import RollingSchedulingEnv
-from src.rules.experience_rule_library import ExperienceRuleLibrary, RULE_NAMES, RULE_TIEBREAK
+from src.rules.experience_rule_library import ExperienceRuleLibrary, RULE_NAMES
 from utils.experiment_io import write_csv
 
 
@@ -30,7 +30,24 @@ PREVIEW_FIELDS = [
     "chosen_job_id",
     "candidate_count",
 ]
-LABEL_FIELDS = ["rule_name", "label_count", "label_ratio", "valid_count", "valid_ratio", "mean_proxy_score"]
+LABEL_FIELDS = [
+    "rule_name",
+    "label_count",
+    "label_ratio",
+    "valid_count",
+    "valid_ratio",
+    "mean_proxy_score",
+    "is_excluded_from_label",
+    "eligible_label_count",
+    "eligible_label_ratio",
+]
+ELIGIBLE_TIEBREAK = {
+    "mlp_ranker_soft_ce": 0,
+    "fifo": 1,
+    "lookahead": 2,
+    "greedy_ect": 3,
+    "minload": 4,
+}
 
 
 def make_run_id(args) -> str:
@@ -56,9 +73,26 @@ def output_paths(args, run_id: str) -> Dict[str, Path]:
     }
 
 
+def excluded_label_rules(args) -> set[str]:
+    return set(args.exclude_label_rules or [])
+
+
+def eligible_recommendations(args, recommendations):
+    excluded = excluded_label_rules(args)
+    return [rec for rec in recommendations if rec.is_valid and rec.rule_name not in excluded]
+
+
+def select_by_proxy_with_eligible_tiebreak(recommendations):
+    return min(recommendations, key=lambda rec: (rec.score_or_proxy, ELIGIBLE_TIEBREAK.get(rec.rule_name, 999), rec.rule_id))
+
+
 def select_label(args, library: ExperienceRuleLibrary, recommendations):
+    eligible = eligible_recommendations(args, recommendations)
+    if not eligible:
+        raise RuntimeError("No eligible valid rule remains after --exclude_label_rules filtering.")
+
     if args.label_mode in {"one_step_cmax", "one_step_ect"}:
-        return library.label_from_proxy(recommendations)
+        return select_by_proxy_with_eligible_tiebreak(eligible)
 
     if args.label_mode != "conservative_margin":
         raise ValueError(f"Unsupported label_mode: {args.label_mode}")
@@ -69,12 +103,14 @@ def select_label(args, library: ExperienceRuleLibrary, recommendations):
             f"conservative_margin requires a valid baseline_rule={args.baseline_rule!r}; "
             "check ranker checkpoint and HybridTopK candidates."
         )
+    if baseline.rule_name in excluded_label_rules(args):
+        raise RuntimeError(f"baseline_rule={baseline.rule_name!r} cannot be excluded from labels.")
 
-    other_valid = [rec for rec in recommendations if rec.is_valid and rec.rule_name != args.baseline_rule]
+    other_valid = [rec for rec in eligible if rec.rule_name != args.baseline_rule]
     if not other_valid:
         return baseline
 
-    best_other = min(other_valid, key=lambda rec: (rec.score_or_proxy, RULE_TIEBREAK.get(rec.rule_name, 999), rec.rule_id))
+    best_other = select_by_proxy_with_eligible_tiebreak(other_valid)
     if best_other.score_or_proxy < baseline.score_or_proxy - float(args.label_margin):
         return best_other
     return baseline
@@ -96,6 +132,7 @@ def build_dataset(args) -> Dict[str, Path]:
     label_counts = Counter()
     valid_counts = Counter()
     proxy_sums = defaultdict(float)
+    eligible_counts = Counter()
 
     for instance in instances:
         env = RollingSchedulingEnv(instance)
@@ -145,6 +182,8 @@ def build_dataset(args) -> Dict[str, Path]:
                 if rec.is_valid:
                     valid_counts[rec.rule_name] += 1
                     proxy_sums[rec.rule_name] += float(rec.score_or_proxy)
+                    if rec.rule_name not in excluded_label_rules(args):
+                        eligible_counts[rec.rule_name] += 1
             env.step((str(label.job_id), choose_split_num(env, str(label.job_id))))
             step_id += 1
 
@@ -155,9 +194,11 @@ def build_dataset(args) -> Dict[str, Path]:
     total_labels = max(1, sum(label_counts.values()))
     total_states = max(1, len(records))
     label_rows = []
+    excluded = excluded_label_rules(args)
     for rule_name in RULE_NAMES:
         valid_count = valid_counts[rule_name]
         label_ratio = label_counts[rule_name] / total_labels
+        eligible_label_count = eligible_counts[rule_name]
         label_rows.append(
             {
                 "rule_name": rule_name,
@@ -166,16 +207,22 @@ def build_dataset(args) -> Dict[str, Path]:
                 "valid_count": valid_count,
                 "valid_ratio": valid_count / total_states,
                 "mean_proxy_score": proxy_sums[rule_name] / max(1, valid_count),
+                "is_excluded_from_label": rule_name in excluded,
+                "eligible_label_count": eligible_label_count,
+                "eligible_label_ratio": eligible_label_count / total_states,
             }
         )
     write_csv(label_rows, paths["label_stats"], LABEL_FIELDS)
-    min_cmax_ratio = label_counts["min_cmax_onestep"] / total_labels
     ranker_ratio = label_counts["mlp_ranker_soft_ce"] / total_labels
     warnings = []
-    if min_cmax_ratio > 0.6:
-        warnings.append(f"WARNING: min_cmax_onestep label_ratio={min_cmax_ratio:.4f} > 0.6")
-    if ranker_ratio < 0.3:
-        warnings.append(f"WARNING: mlp_ranker_soft_ce label_ratio={ranker_ratio:.4f} < 0.3")
+    if ranker_ratio < 0.35:
+        warnings.append(f"WARNING: mlp_ranker_soft_ce label_ratio={ranker_ratio:.4f} < 0.35")
+    for rule_name in RULE_NAMES:
+        if rule_name != args.baseline_rule and label_counts[rule_name] / total_labels > 0.5:
+            warnings.append(f"WARNING: non-baseline rule {rule_name} label_ratio={label_counts[rule_name] / total_labels:.4f} > 0.5")
+    active_label_rules = [rule for rule in RULE_NAMES if label_counts[rule] > 0]
+    if len(active_label_rules) <= 1:
+        warnings.append(f"WARNING: labels concentrate in {len(active_label_rules)} rule(s): {active_label_rules}")
     for message in warnings:
         print(message)
     paths["manifest"].write_text(
@@ -185,6 +232,7 @@ def build_dataset(args) -> Dict[str, Path]:
                 "start_time": datetime.now().isoformat(timespec="seconds"),
                 "command_args": vars(args),
                 "dataset_path": str(paths["dataset"]),
+                "exclude_label_rules": sorted(excluded),
                 "warnings": warnings,
                 "python_version": sys.version,
             },
@@ -209,6 +257,7 @@ def main() -> None:
     )
     parser.add_argument("--baseline_rule", choices=RULE_NAMES, default="mlp_ranker_soft_ce")
     parser.add_argument("--label_margin", type=float, default=0.5)
+    parser.add_argument("--exclude_label_rules", nargs="*", choices=RULE_NAMES, default=[])
     parser.add_argument("--max_instances", type=int, default=None)
     parser.add_argument("--output_dir", default="data/processed/stage_F/rule_library_bc")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
