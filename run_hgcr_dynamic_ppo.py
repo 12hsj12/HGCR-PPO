@@ -135,7 +135,7 @@ class RuleActorCritic(nn.Module):
 def make_run_id(args) -> str:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return (
-        f"HGCRDYN_{args.size}_k{args.top_k}_e{args.episodes}_s{args.seed}"
+        f"HGCRDYN_stageG_{args.size}_k{args.top_k}_e{args.episodes}_s{args.seed}"
         f"_{args.arrival_intensity}_{args.carryover_ratio}_b{args.reward_beta}_{stamp}_{uuid.uuid4().hex[:8]}"
     )
 
@@ -463,6 +463,19 @@ def run(args) -> Path:
     paths["manifest"].write_text(
         json.dumps(
             {
+                "stage": "G",
+                "experiment_family": "hgcr_dynamic_ppo",
+                "scenario_type": "dynamic_rolling",
+                "size": args.size,
+                "top_k": args.top_k,
+                "episodes": args.episodes,
+                "seed": args.seed,
+                "arrival_intensity": args.arrival_intensity,
+                "carryover_ratio": args.carryover_ratio,
+                "reward_mode": args.reward_mode,
+                "reward_beta": args.reward_beta,
+                "baseline_method": args.baseline_method,
+                "output_dir": args.output_dir,
                 "run_id": run_id,
                 "method": "HGCR-Dynamic-PPO",
                 "args": vars(args),
@@ -509,7 +522,7 @@ def main() -> None:
     parser.add_argument("--early_stop_patience", type=int, default=10)
     parser.add_argument("--num_scenarios", type=int, default=200)
     parser.add_argument("--eval_scenarios", type=int, default=50)
-    parser.add_argument("--output_dir", default="data/results/stage_F/hgcr_dynamic_ppo")
+    parser.add_argument("--output_dir", default="data/results/stage_G/hgcr_dynamic_ppo")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--smoke_test", action="store_true")
     args = parser.parse_args()
