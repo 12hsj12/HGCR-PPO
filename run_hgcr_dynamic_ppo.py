@@ -143,14 +143,17 @@ def make_run_id(args) -> str:
 def output_paths(args, run_id: str) -> Dict[str, Path]:
     run_dir = Path(args.output_dir) / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
+    # Keep the full metadata-rich run_id in the directory name and manifest.
+    # Repeating it in every filename can exceed Windows' traditional MAX_PATH
+    # limit on user workstations with deep project paths.
     return {
         "run_dir": run_dir,
-        "train": run_dir / f"train_log__{run_id}.csv",
-        "eval_summary": run_dir / f"eval_summary__{run_id}.csv",
-        "action_ratio": run_dir / f"action_ratio__{run_id}.csv",
-        "curve": run_dir / f"reward_cmax_curve__{run_id}.csv",
-        "manifest": run_dir / f"manifest__{run_id}.json",
-        "checkpoint": run_dir / f"hgcr_dynamic_ppo__{run_id}.pt",
+        "train": run_dir / "train_log.csv",
+        "eval_summary": run_dir / "eval_summary.csv",
+        "action_ratio": run_dir / "action_ratio.csv",
+        "curve": run_dir / "reward_cmax_curve.csv",
+        "manifest": run_dir / "manifest.json",
+        "checkpoint": run_dir / "hgcr_dynamic_ppo.pt",
     }
 
 
