@@ -68,6 +68,24 @@ SUMMARY_FIELDS = [
     "runtime_mean",
     "valid_schedule_rate",
 ]
+TRACE_FIELDS = [
+    "scenario_run_id",
+    "arrival_intensity",
+    "carryover_ratio",
+    "reward_beta",
+    "seed",
+    "instance_id",
+    "method",
+    "job_id",
+    "batch_id",
+    "process_type",
+    "machine_id",
+    "start_time",
+    "end_time",
+    "duration",
+    "split_ratio",
+    "rolling_period",
+]
 
 
 def run_id() -> str:
@@ -235,6 +253,33 @@ def detail_row(run_manifest: dict, scenario: dict, method: str, env, runtime: fl
     }
 
 
+def schedule_trace_rows(run_manifest: dict, scenario: dict, method: str, env) -> List[dict]:
+    period = float(getattr(scenario["instance"], "rolling_period_length", 1.0) or 1.0)
+    rows = []
+    for subtask in env.subtasks:
+        rows.append(
+            {
+                "scenario_run_id": run_manifest["run_id"],
+                "arrival_intensity": run_manifest["arrival_intensity"],
+                "carryover_ratio": run_manifest["carryover_ratio"],
+                "reward_beta": run_manifest["reward_beta"],
+                "seed": run_manifest["seed"],
+                "instance_id": scenario["scenario_id"],
+                "method": method,
+                "job_id": subtask.job_id,
+                "batch_id": scenario["scenario_id"],
+                "process_type": subtask.process_type,
+                "machine_id": subtask.machine_id,
+                "start_time": subtask.start_time,
+                "end_time": subtask.completion_time,
+                "duration": subtask.duration,
+                "split_ratio": subtask.ratio,
+                "rolling_period": int(subtask.start_time // period),
+            }
+        )
+    return rows
+
+
 def summarize(rows: Sequence[dict]) -> List[dict]:
     groups: Dict[tuple, List[dict]] = {}
     for row in rows:
@@ -289,6 +334,7 @@ def run(args) -> Path | None:
     device = args.device
     ranker_model = None if "MLP-Ranker" not in methods else load_ranker(args.ranker_ckpt, device)
     detail_rows: List[dict] = []
+    trace_rows: List[dict] = []
     for run_dir, manifest in selected:
         from dynamic_rolling_scenarios import generate_dynamic_scenarios
 
@@ -316,13 +362,17 @@ def run(args) -> Path | None:
                     canonical = "MinCandidateLoad" if method == "MinLoad" else method
                     env, runtime = rollout_rule(scenario, canonical, int(manifest["seed"]), ranker_model=ranker_model, device=device, top_k=int(manifest["top_k"]))
                 detail_rows.append(detail_row(manifest, scenario, method, env, runtime))
+                if args.save_schedule_trace:
+                    trace_rows.extend(schedule_trace_rows(manifest, scenario, method, env))
 
     summary_rows = summarize(detail_rows)
     if args.no_write:
-        print(f"No-write enabled: evaluated {len(detail_rows)} detail rows, no files written.")
+        print(f"No-write enabled: evaluated {len(detail_rows)} detail rows and {len(trace_rows)} trace rows, no files written.")
         return out_dir
     write_csv(out_dir / f"baseline_eval_detail__{eval_id}.csv", detail_rows, DETAIL_FIELDS)
     write_csv(out_dir / f"baseline_eval_summary__{eval_id}.csv", summary_rows, SUMMARY_FIELDS)
+    if args.save_schedule_trace:
+        write_csv(out_dir / f"schedule_trace__{eval_id}.csv", trace_rows, TRACE_FIELDS)
     (out_dir / f"manifest__{eval_id}.json").write_text(
         json.dumps({"run_id": eval_id, "stage": "G", "args": vars(args), "source_runs": [m["run_id"] for _, m in selected]}, indent=2),
         encoding="utf-8",
@@ -342,6 +392,7 @@ def main() -> None:
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--no_write", action="store_true")
     parser.add_argument("--smoke_test", action="store_true")
+    parser.add_argument("--save_schedule_trace", action="store_true")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     args = parser.parse_args()
     if args.smoke_test:

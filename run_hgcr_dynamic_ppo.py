@@ -53,6 +53,22 @@ TRAIN_FIELDS = [
     "value_loss",
     "entropy",
     "approx_kl",
+    "is_eval_step",
+]
+EVAL_HISTORY_FIELDS = [
+    "eval_step",
+    "episode",
+    "seed",
+    "arrival_intensity",
+    "carryover_ratio",
+    "reward_beta",
+    "eval_Cmax_mean",
+    "eval_Cmax_std",
+    "eval_reward_mean",
+    "eval_reward_std",
+    "best_so_far_Cmax",
+    "baseline_FIFO_Cmax",
+    "baseline_MLPRanker_Cmax",
 ]
 EVAL_FIELDS = [
     "method",
@@ -152,6 +168,7 @@ def output_paths(args, run_id: str) -> Dict[str, Path]:
         "eval_summary": run_dir / "eval_summary.csv",
         "action_ratio": run_dir / "action_ratio.csv",
         "curve": run_dir / "reward_cmax_curve.csv",
+        "eval_history": run_dir / "eval_history.csv",
         "manifest": run_dir / "manifest.json",
         "checkpoint": run_dir / "hgcr_dynamic_ppo.pt",
     }
@@ -342,20 +359,25 @@ def update(model, optimizer, buffer: PPOBuffer, args, device):
 
 def evaluate_method(name: str, model, scenarios, args, ranker_model, device) -> dict:
     cmax_values = []
+    reward_values = []
     runtimes = []
     valid = []
     for scenario in scenarios:
         if name == "HGCR-PPO":
-            env, _, _, _ = run_episode(model, scenario, args, ranker_model, device, train_mode=False)
+            env, _, _, ep = run_episode(model, scenario, args, ranker_model, device, train_mode=False)
+            reward_values.append(float(ep["total_reward"]))
             runtime = 0.0
         else:
             env, _, runtime = rollout_rule_policy(scenario, name, ranker_model=ranker_model, device=str(device), top_k=args.top_k)
+            reward_values.append(0.0)
         cmax_values.append(float(env.current_cmax))
         runtimes.append(runtime)
         valid.append(1.0 if validate_schedule(env, scenario["instance"])["is_valid_schedule"] else 0.0)
     return {
         "Cmax_mean": mean(cmax_values),
         "Cmax_std": pstdev(cmax_values) if len(cmax_values) > 1 else 0.0,
+        "reward_mean": mean(reward_values),
+        "reward_std": pstdev(reward_values) if len(reward_values) > 1 else 0.0,
         "valid_schedule_rate": mean(valid),
         "runtime_mean": mean(runtimes),
     }
@@ -425,6 +447,7 @@ def run(args) -> Path:
     buffer = PPOBuffer()
     train_rows = []
     curve_rows = []
+    eval_history_rows = []
     action_counts = Counter()
     best_cmax = float("inf")
     best_state = None
@@ -441,14 +464,34 @@ def run(args) -> Path:
             buffer.clear()
         if episode % max(1, args.eval_interval) == 0 or episode == args.episodes:
             eval_rows = evaluate_all(model, eval_scenarios, args, ranker_model, device)
-            hgcr_cmax = next(row["Cmax_mean"] for row in eval_rows if row["method"] == "HGCR-PPO")
+            hgcr_row = next(row for row in eval_rows if row["method"] == "HGCR-PPO")
+            fifo_row = next(row for row in eval_rows if row["method"] == "FIFO")
+            mlp_row = next(row for row in eval_rows if row["method"] == "MLP_Ranker_soft_ce")
+            hgcr_cmax = hgcr_row["Cmax_mean"]
             if hgcr_cmax < best_cmax:
                 best_cmax = hgcr_cmax
                 best_state = deepcopy(model.state_dict())
                 bad_evals = 0
             else:
                 bad_evals += 1
-        row = {"episode": episode, **ep, **stats}
+            eval_history_rows.append(
+                {
+                    "eval_step": len(eval_history_rows) + 1,
+                    "episode": episode,
+                    "seed": args.seed,
+                    "arrival_intensity": args.arrival_intensity,
+                    "carryover_ratio": args.carryover_ratio,
+                    "reward_beta": args.reward_beta,
+                    "eval_Cmax_mean": hgcr_row["Cmax_mean"],
+                    "eval_Cmax_std": hgcr_row["Cmax_std"],
+                    "eval_reward_mean": hgcr_row["reward_mean"],
+                    "eval_reward_std": hgcr_row["reward_std"],
+                    "best_so_far_Cmax": best_cmax,
+                    "baseline_FIFO_Cmax": fifo_row["Cmax_mean"],
+                    "baseline_MLPRanker_Cmax": mlp_row["Cmax_mean"],
+                }
+            )
+        row = {"episode": episode, **ep, **stats, "is_eval_step": bool(eval_history_rows and eval_history_rows[-1]["episode"] == episode)}
         train_rows.append(row)
         curve_rows.append({key: row[key] for key in CURVE_FIELDS})
         if bad_evals >= args.early_stop_patience and not args.smoke_test:
@@ -462,6 +505,7 @@ def run(args) -> Path:
     write_csv(eval_rows, paths["eval_summary"], EVAL_FIELDS)
     write_csv(action_ratio_rows(action_counts), paths["action_ratio"], ACTION_FIELDS)
     write_csv(curve_rows, paths["curve"], CURVE_FIELDS)
+    write_csv(eval_history_rows, paths["eval_history"], EVAL_HISTORY_FIELDS)
     torch.save({"model_state_dict": model.state_dict(), "state_dim": state_dim, "rule_names": RULE_NAMES, "run_id": run_id}, paths["checkpoint"])
     paths["manifest"].write_text(
         json.dumps(

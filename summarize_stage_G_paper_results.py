@@ -31,6 +31,8 @@ def latest_paths(output_dir: Path, suffix: str) -> Dict[str, Path]:
         "rank": output_dir / f"stage_G_rank_summary__{suffix}.csv",
         "heatmap": output_dir / f"stage_G_scenario_heatmap__{suffix}.csv",
         "action_perf": output_dir / f"stage_G_action_performance_summary__{suffix}.csv",
+        "significance": output_dir / f"stage_G_significance_tests__{suffix}.csv",
+        "arpd": output_dir / f"stage_G_arpd_summary__{suffix}.csv",
         "report": output_dir / f"stage_G_paper_report__{suffix}.md",
     }
 
@@ -115,15 +117,16 @@ def collect_stage_g_actions(root: Path) -> List[dict]:
 def method_summary(detail: Sequence[dict]) -> List[dict]:
     groups: Dict[tuple, List[dict]] = {}
     for row in detail:
-        key = (row["arrival_intensity"], row["carryover_ratio"], row["seed"], row["method"])
+        key = (row["arrival_intensity"], row["carryover_ratio"], row.get("reward_beta", ""), row["seed"], row["method"])
         groups.setdefault(key, []).append(row)
     out = []
-    for (arrival, carryover, seed, method), vals in sorted(groups.items()):
+    for (arrival, carryover, beta, seed, method), vals in sorted(groups.items()):
         cmax = [fnum(row["Cmax"]) for row in vals]
         out.append(
             {
                 "arrival_intensity": arrival,
                 "carryover_ratio": carryover,
+                "reward_beta": beta,
                 "seed": seed,
                 "method": method,
                 "Cmax_mean": mean(cmax),
@@ -201,6 +204,83 @@ def rank_summary(detail: Sequence[dict]) -> List[dict]:
     return out
 
 
+def paired_p_value(gaps: List[float]) -> float:
+    if not gaps:
+        return 1.0
+    try:
+        from scipy.stats import wilcoxon
+
+        return float(wilcoxon(gaps, alternative="greater").pvalue)
+    except Exception:
+        pass
+    if len(gaps) < 2:
+        return 1.0
+    avg = mean(gaps)
+    sd = pstdev(gaps)
+    if sd <= 1e-12:
+        return 0.0 if avg > 0 else 1.0
+    t_value = avg / (sd / (len(gaps) ** 0.5))
+    import math
+
+    return 0.5 * math.erfc(t_value / (2.0 ** 0.5))
+
+
+def significance_tests(detail: Sequence[dict]) -> List[dict]:
+    by_instance: Dict[tuple, Dict[str, float]] = {}
+    for row in detail:
+        by_instance.setdefault((row["scenario_run_id"], row["instance_id"]), {})[row["method"]] = fnum(row["Cmax"])
+    rows = []
+    for method in ["FIFO", "MLP-Ranker", "GreedyECT", "Lookahead", "MinLoad"]:
+        gaps = []
+        for values in by_instance.values():
+            if "HGCR-PPO" in values and method in values:
+                gaps.append(values[method] - values["HGCR-PPO"])
+        p_value = paired_p_value(gaps)
+        rows.append(
+            {
+                "method": method,
+                "n_pairs": len(gaps),
+                "mean_gap": mean(gaps) if gaps else 0.0,
+                "median_gap": median(gaps) if gaps else 0.0,
+                "p_value": p_value,
+                "significant_at_0_05": p_value < 0.05,
+            }
+        )
+    return rows
+
+
+def arpd_summary(detail: Sequence[dict], rank_rows: Sequence[dict], wtl_rows: Sequence[dict]) -> List[dict]:
+    by_instance: Dict[tuple, Dict[str, float]] = {}
+    for row in detail:
+        by_instance.setdefault((row["scenario_run_id"], row["instance_id"]), {})[row["method"]] = fnum(row["Cmax"])
+    arpd_by_method: Dict[str, List[float]] = {}
+    for values in by_instance.values():
+        if not values:
+            continue
+        best = min(values.values())
+        for method, cmax in values.items():
+            arpd_by_method.setdefault(method, []).append((cmax - best) / max(best, 1e-8) * 100.0)
+    rank_map = {row["method"]: row for row in rank_rows}
+    wtl_map = {row["baseline_method"]: row for row in wtl_rows}
+    out = []
+    for method in sorted(arpd_by_method, key=lambda m: METHOD_ORDER.index(m) if m in METHOD_ORDER else 99):
+        vals = arpd_by_method[method]
+        rank = rank_map.get(method, {})
+        wtl = wtl_map.get(method, {})
+        out.append(
+            {
+                "method": method,
+                "ARPD_mean": mean(vals),
+                "ARPD_std": pstdev(vals) if len(vals) > 1 else 0.0,
+                "mean_rank": fnum(rank.get("mean_rank")),
+                "rank1_count": rank.get("rank1_count", 0),
+                "top3_count": rank.get("top3_count", 0),
+                "win_rate_vs_HGCR": "" if method == "HGCR-PPO" else fnum(wtl.get("loss_rate")),
+            }
+        )
+    return out
+
+
 def scenario_heatmap(summary_rows: Sequence[dict], rank_rows: Sequence[dict]) -> List[dict]:
     groups: Dict[tuple, Dict[str, List[float]]] = {}
     for row in summary_rows:
@@ -227,7 +307,7 @@ def scenario_heatmap(summary_rows: Sequence[dict], rank_rows: Sequence[dict]) ->
     return out
 
 
-def report_text(detail, summary, wtl, rank, heatmap, action_perf) -> str:
+def report_text(detail, summary, wtl, rank, heatmap, action_perf, sig, arpd) -> str:
     return "\n".join(
         [
             "# 阶段 G 论文级结果汇总",
@@ -242,7 +322,7 @@ def report_text(detail, summary, wtl, rank, heatmap, action_perf) -> str:
             f"当前合并 {len(detail)} 条 per-instance 记录，形成 {len(summary)} 条方法-场景汇总。",
             "",
             "## 4. 胜负统计结果",
-            f"win/tie/loss 表包含 {len(wtl)} 个 HGCR-PPO 对比基线。",
+            f"win/tie/loss 表包含 {len(wtl)} 个 HGCR-PPO 对比基线；显著性检验表包含 {len(sig)} 个配对检验。",
             "",
             "## 5. 动态扰动热力图结果",
             f"heatmap 表包含 {len(heatmap)} 个 arrival × carryover 场景。",
@@ -254,7 +334,7 @@ def report_text(detail, summary, wtl, rank, heatmap, action_perf) -> str:
             "建议选择 HGCR-PPO 相比 FIFO gap 最大的实例，展示 FIFO 与 HGCR-PPO 的产线占用差异、Cmax 和利用率。",
             "",
             "## 8. 论文图表建议",
-            "主文优先使用多算法对比、per-instance 箱线图、win/tie/loss、rank summary、动作-性能 panel；reward scaling 和训练曲线作为补充图。",
+            f"主文优先使用多算法对比、per-instance 箱线图、win/tie/loss、rank/ARPD summary、动作-性能 panel；当前 ARPD 表包含 {len(arpd)} 个方法。",
             "",
         ]
     )
@@ -277,17 +357,21 @@ def run(args):
     rank = rank_summary(detail)
     heatmap = scenario_heatmap(summary, rank)
     action_perf = collect_stage_g_actions(Path(args.hgcr_runs_dir))
+    sig = significance_tests(detail)
+    arpd = arpd_summary(detail, rank, wtl)
     if args.no_write:
         print(f"No-write enabled: read {len(detail)} detail rows, no files written.")
         return paths
     write_csv(paths["detail"], detail, list(detail[0].keys()) if detail else [])
-    write_csv(paths["summary"], summary, ["arrival_intensity", "carryover_ratio", "seed", "method", "Cmax_mean", "Cmax_std", "Cmax_min", "Cmax_max", "instance_count"])
+    write_csv(paths["summary"], summary, ["arrival_intensity", "carryover_ratio", "reward_beta", "seed", "method", "Cmax_mean", "Cmax_std", "Cmax_min", "Cmax_max", "instance_count"])
     write_csv(paths["wtl"], wtl, ["baseline_method", "win_count", "tie_count", "loss_count", "win_rate", "tie_rate", "loss_rate", "mean_gap", "median_gap"])
     write_csv(paths["rank"], rank, ["method", "mean_rank", "median_rank", "rank1_count", "top2_count", "top3_count", "instance_count"])
     write_csv(paths["heatmap"], heatmap, ["arrival_intensity", "carryover_ratio", "HGCR_PPO_Cmax_mean", "FIFO_Cmax_mean", "MLPRanker_Cmax_mean", "HGCR_improvement_over_FIFO", "HGCR_improvement_over_MLP", "HGCR_mean_rank"])
     write_csv(paths["action_perf"], action_perf, ["arrival_intensity", "carryover_ratio", "seed", "FIFO_ratio", "GreedyECT_ratio", "Lookahead_ratio", "MLPRanker_ratio", "HGCR_Cmax", "FIFO_Cmax", "MLPRanker_Cmax", "HGCR_relative_to_FIFO", "HGCR_relative_to_MLP"])
+    write_csv(paths["significance"], sig, ["method", "n_pairs", "mean_gap", "median_gap", "p_value", "significant_at_0_05"])
+    write_csv(paths["arpd"], arpd, ["method", "ARPD_mean", "ARPD_std", "mean_rank", "rank1_count", "top3_count", "win_rate_vs_HGCR"])
     paths["report"].parent.mkdir(parents=True, exist_ok=True)
-    paths["report"].write_text(report_text(detail, summary, wtl, rank, heatmap, action_perf), encoding="utf-8")
+    paths["report"].write_text(report_text(detail, summary, wtl, rank, heatmap, action_perf, sig, arpd), encoding="utf-8")
     print(f"Saved Stage G paper results to {args.output_dir}")
     return paths
 
