@@ -42,6 +42,7 @@ DETAIL_FIELDS = [
     "reward_beta",
     "seed",
     "instance_id",
+    "case_id",
     "method",
     "Cmax",
     "average_completion_time",
@@ -235,6 +236,7 @@ def rollout_hgcr(scenario: dict, model, ranker_model, manifest: dict, device: st
 def detail_row(run_manifest: dict, scenario: dict, method: str, env, runtime: float) -> dict:
     metrics = compute_metrics(env)
     valid = validate_schedule(env, scenario["instance"])["is_valid_schedule"]
+    case_id = f"{run_manifest['arrival_intensity']}-{run_manifest['carryover_ratio']}-seed{run_manifest['seed']}-inst{scenario['scenario_id']}"
     return {
         "scenario_run_id": run_manifest["run_id"],
         "arrival_intensity": run_manifest["arrival_intensity"],
@@ -242,6 +244,7 @@ def detail_row(run_manifest: dict, scenario: dict, method: str, env, runtime: fl
         "reward_beta": run_manifest["reward_beta"],
         "seed": run_manifest["seed"],
         "instance_id": scenario["scenario_id"],
+        "case_id": case_id,
         "method": "MinLoad" if method == "MinCandidateLoad" else method,
         "Cmax": metrics["Cmax_roll"],
         "average_completion_time": metrics["average_completion_time"],

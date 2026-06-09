@@ -84,6 +84,8 @@ EVAL_FIELDS = [
 ]
 ACTION_FIELDS = ["rule_name", "selection_count", "selection_ratio"]
 CURVE_FIELDS = ["episode", "episode_reward", "episode_Cmax", "step_reward_sum", "final_reward", "total_reward"]
+ACTION_HISTORY_FIELDS = ["episode", "decision_index", "seed", "arrival_intensity", "carryover_ratio", "reward_beta", "action_id", "action_name", "is_eval"]
+ACTION_STAGE_FIELDS = ["stage_start_episode", "stage_end_episode", "seed", "arrival_intensity", "carryover_ratio", "reward_beta", "action_name", "action_count", "action_ratio"]
 
 
 @dataclass
@@ -166,6 +168,10 @@ def output_paths(args, run_id: str) -> Dict[str, Path]:
     eval_history_path = preferred_eval_history
     if len(str(preferred_eval_history.resolve())) > 240:
         eval_history_path = run_dir / "eval_history.csv"
+    preferred_action_history = run_dir / f"action_history__{run_id}.csv"
+    action_history_path = preferred_action_history if len(str(preferred_action_history.resolve())) <= 240 else run_dir / "action_history.csv"
+    preferred_action_stage = run_dir / f"action_stage_summary__{run_id}.csv"
+    action_stage_path = preferred_action_stage if len(str(preferred_action_stage.resolve())) <= 240 else run_dir / "action_stage_summary.csv"
     return {
         "run_dir": run_dir,
         "train": run_dir / "train_log.csv",
@@ -173,6 +179,8 @@ def output_paths(args, run_id: str) -> Dict[str, Path]:
         "action_ratio": run_dir / "action_ratio.csv",
         "curve": run_dir / "reward_cmax_curve.csv",
         "eval_history": eval_history_path,
+        "action_history": action_history_path,
+        "action_stage": action_stage_path,
         "manifest": run_dir / "manifest.json",
         "checkpoint": run_dir / "hgcr_dynamic_ppo.pt",
     }
@@ -267,6 +275,7 @@ def select_action(model, state, device, greedy: bool = False):
 def rollout_rule_policy(scenario: dict, rule_name: str, ranker_model=None, device: str = "cpu", top_k: int = 5):
     env = reset_env_for_scenario(scenario)
     counts = Counter()
+    action_sequence = []
     start = time.perf_counter()
     while not env.is_done():
         job_id = _first_by_rule(env, rule_name, ranker_model=ranker_model, device=device, top_k=top_k)
@@ -305,6 +314,7 @@ def run_episode(model, scenario: dict, args, ranker_model, device, train_mode: b
         old_util = new_util
         step_reward_sum += step_reward
         counts[rule_name] += 1
+        action_sequence.append((action, rule_name))
         buffer.add(state, action, logprob, step_reward, value, env.is_done())
 
     base = baseline_cmax(scenario, args.baseline_method, ranker_model=ranker_model, device=str(device), top_k=args.top_k)
@@ -315,7 +325,7 @@ def run_episode(model, scenario: dict, args, ranker_model, device, train_mode: b
         buffer.rewards[-1] += final_reward
     total_reward = step_reward_sum + final_reward
     metrics = compute_metrics(env)
-    return env, buffer, counts, {
+    return env, buffer, counts, action_sequence, {
         "episode_reward": total_reward,
         "episode_Cmax": agent_cmax,
         "machine_utilization": metrics["machine_utilization"],
@@ -368,7 +378,7 @@ def evaluate_method(name: str, model, scenarios, args, ranker_model, device) -> 
     valid = []
     for scenario in scenarios:
         if name == "HGCR-PPO":
-            env, _, _, ep = run_episode(model, scenario, args, ranker_model, device, train_mode=False)
+            env, _, _, _, ep = run_episode(model, scenario, args, ranker_model, device, train_mode=False)
             reward_values.append(float(ep["total_reward"]))
             runtime = 0.0
         else:
@@ -412,6 +422,32 @@ def action_ratio_rows(counts: Counter) -> List[dict]:
     return [{"rule_name": rule, "selection_count": counts[rule], "selection_ratio": counts[rule] / total} for rule in RULE_NAMES]
 
 
+def action_stage_rows(action_history_rows: List[dict], args) -> List[dict]:
+    stage_size = int(getattr(args, "action_stage_episodes", 1000))
+    rows = []
+    max_episode = max((int(row["episode"]) for row in action_history_rows), default=0)
+    for start in range(1, max_episode + 1, stage_size):
+        end = min(start + stage_size - 1, max_episode)
+        bucket = [row for row in action_history_rows if start <= int(row["episode"]) <= end and not row["is_eval"]]
+        total = max(1, len(bucket))
+        counts = Counter(row["action_name"] for row in bucket)
+        for name in ["FIFO", "GreedyECT", "Lookahead", "MLP-Ranker"]:
+            rows.append(
+                {
+                    "stage_start_episode": start,
+                    "stage_end_episode": end,
+                    "seed": args.seed,
+                    "arrival_intensity": args.arrival_intensity,
+                    "carryover_ratio": args.carryover_ratio,
+                    "reward_beta": args.reward_beta,
+                    "action_name": name,
+                    "action_count": counts[name],
+                    "action_ratio": counts[name] / total,
+                }
+            )
+    return rows
+
+
 def run(args) -> Path:
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -452,16 +488,31 @@ def run(args) -> Path:
     train_rows = []
     curve_rows = []
     eval_history_rows = []
+    action_history_rows = []
     action_counts = Counter()
     best_cmax = float("inf")
     best_state = None
     bad_evals = 0
     for episode in progress_iter(range(1, args.episodes + 1), desc="hgcr-dynamic-ppo train", total=args.episodes):
         scenario = scenarios[(episode - 1) % len(scenarios)]
-        _, ep_buffer, counts, ep = run_episode(model, scenario, args, ranker_model, device, train_mode=True)
+        _, ep_buffer, counts, actions, ep = run_episode(model, scenario, args, ranker_model, device, train_mode=True)
         for idx in range(len(ep_buffer)):
             buffer.add(ep_buffer.states[idx], ep_buffer.actions[idx], ep_buffer.logprobs[idx], ep_buffer.rewards[idx], ep_buffer.values[idx], ep_buffer.dones[idx])
         action_counts.update(counts)
+        for decision_idx, (action_id, action_name) in enumerate(actions, start=1):
+            action_history_rows.append(
+                {
+                    "episode": episode,
+                    "decision_index": decision_idx,
+                    "seed": args.seed,
+                    "arrival_intensity": args.arrival_intensity,
+                    "carryover_ratio": args.carryover_ratio,
+                    "reward_beta": args.reward_beta,
+                    "action_id": action_id,
+                    "action_name": "MLP-Ranker" if action_name == "MLP_Ranker_soft_ce" else action_name,
+                    "is_eval": False,
+                }
+            )
         stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "approx_kl": 0.0}
         if len(buffer) >= args.batch_size or episode == args.episodes:
             stats = update(model, optimizer, buffer, args, device)
@@ -510,6 +561,8 @@ def run(args) -> Path:
     write_csv(action_ratio_rows(action_counts), paths["action_ratio"], ACTION_FIELDS)
     write_csv(curve_rows, paths["curve"], CURVE_FIELDS)
     write_csv(eval_history_rows, paths["eval_history"], EVAL_HISTORY_FIELDS)
+    write_csv(action_history_rows, paths["action_history"], ACTION_HISTORY_FIELDS)
+    write_csv(action_stage_rows(action_history_rows, args), paths["action_stage"], ACTION_STAGE_FIELDS)
     torch.save({"model_state_dict": model.state_dict(), "state_dim": state_dim, "rule_names": RULE_NAMES, "run_id": run_id}, paths["checkpoint"])
     paths["manifest"].write_text(
         json.dumps(
@@ -536,6 +589,8 @@ def run(args) -> Path:
                 "best_eval_Cmax_mean": best_cmax,
                 "output_files": {key: str(value) for key, value in paths.items() if key != "run_dir"},
                 "eval_history_path": str(paths["eval_history"]),
+                "action_history_path": str(paths["action_history"]),
+                "action_stage_summary_path": str(paths["action_stage"]),
                 "python_version": sys.version,
             },
             indent=2,
@@ -574,6 +629,7 @@ def main() -> None:
     parser.add_argument("--early_stop_patience", type=int, default=10)
     parser.add_argument("--num_scenarios", type=int, default=200)
     parser.add_argument("--eval_scenarios", type=int, default=50)
+    parser.add_argument("--action_stage_episodes", type=int, default=1000)
     parser.add_argument("--output_dir", default="data/results/stage_G/hgcr_dynamic_ppo")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--smoke_test", action="store_true")
