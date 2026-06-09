@@ -13,7 +13,7 @@ from typing import Dict, Iterable, List, Sequence
 
 
 HGCR_RUNS_DIR = Path("data/results/stage_G/hgcr_dynamic_ppo/runs")
-BASELINE_DIR = Path("data/results/stage_G/baseline_eval/runs")
+BASELINE_DIR = Path("data/results/stage_G/paper_results")
 OUTPUT_DIR = Path("data/results/stage_G/paper_results")
 METHOD_ORDER = ["Random", "SPT", "LPT", "MinLoad", "GreedyECT", "Lookahead", "FIFO", "MLP-Ranker", "HGCR-PPO"]
 RULES = ["FIFO", "GreedyECT", "Lookahead", "MLP-Ranker"]
@@ -62,8 +62,10 @@ def collect_baseline_detail(root: Path) -> List[dict]:
     if not root.exists():
         print(f"Warning: baseline eval root does not exist: {root}")
         return rows
-    for path in sorted(root.glob("*/baseline_eval_detail__*.csv")):
-        rows.extend(read_csv(path))
+    patterns = ["stage_G_method_comparison_detail__*.csv", "*/baseline_eval_detail__*.csv"]
+    for pattern in patterns:
+        for path in sorted(root.glob(pattern)):
+            rows.extend(read_csv(path))
     return rows
 
 
@@ -133,13 +135,20 @@ def method_summary(detail: Sequence[dict]) -> List[dict]:
                 "Cmax_std": pstdev(cmax) if len(cmax) > 1 else 0.0,
                 "Cmax_min": min(cmax),
                 "Cmax_max": max(cmax),
+                "average_completion_time_mean": mean(fnum(row.get("average_completion_time")) for row in vals),
+                "average_waiting_time_mean": mean(fnum(row.get("average_waiting_time")) for row in vals),
+                "machine_utilization_mean": mean(fnum(row.get("machine_utilization")) for row in vals),
+                "load_balance_std_mean": mean(fnum(row.get("load_balance_std")) for row in vals),
+                "runtime_seconds_mean": mean(fnum(row.get("runtime_seconds")) for row in vals),
+                "valid_schedule_rate": mean(1.0 if str(row.get("valid_schedule")).lower() == "true" else 0.0 for row in vals),
                 "instance_count": len(vals),
+                "n_instances": len(vals),
             }
         )
     return out
 
 
-def win_tie_loss(detail: Sequence[dict], tolerance: float = 1e-6) -> List[dict]:
+def win_tie_loss(detail: Sequence[dict], tolerance: float = 0.001) -> List[dict]:
     by_instance: Dict[tuple, Dict[str, float]] = {}
     meta: Dict[tuple, dict] = {}
     for row in detail:
@@ -156,12 +165,13 @@ def win_tie_loss(detail: Sequence[dict], tolerance: float = 1e-6) -> List[dict]:
                 continue
             gap = values[method] - values["HGCR-PPO"]
             gaps.append(gap)
-            if gap > tolerance:
-                wins += 1
-            elif gap < -tolerance:
-                losses += 1
-            else:
+            relative = abs(values["HGCR-PPO"] - values[method]) / max(values[method], 1e-8)
+            if relative <= tolerance:
                 ties += 1
+            elif gap > 0:
+                wins += 1
+            else:
+                losses += 1
         total = max(1, wins + ties + losses)
         out.append(
             {
@@ -210,7 +220,7 @@ def paired_p_value(gaps: List[float]) -> float:
     try:
         from scipy.stats import wilcoxon
 
-        return float(wilcoxon(gaps, alternative="greater").pvalue)
+        return float(wilcoxon(gaps, alternative="less").pvalue)
     except Exception:
         pass
     if len(gaps) < 2:
@@ -234,16 +244,25 @@ def significance_tests(detail: Sequence[dict]) -> List[dict]:
         gaps = []
         for values in by_instance.values():
             if "HGCR-PPO" in values and method in values:
-                gaps.append(values[method] - values["HGCR-PPO"])
+                gaps.append(values["HGCR-PPO"] - values[method])
         p_value = paired_p_value(gaps)
+        avg_gap = mean(gaps) if gaps else 0.0
+        med_gap = median(gaps) if gaps else 0.0
         rows.append(
             {
+                "comparison": f"HGCR-PPO_vs_{method}",
                 "method": method,
+                "baseline_method": method,
+                "test_name": "wilcoxon_or_paired_t_fallback",
                 "n_pairs": len(gaps),
-                "mean_gap": mean(gaps) if gaps else 0.0,
-                "median_gap": median(gaps) if gaps else 0.0,
+                "mean_diff": avg_gap,
+                "median_diff": med_gap,
+                "mean_gap": avg_gap,
+                "median_gap": med_gap,
                 "p_value": p_value,
+                "significant": p_value < 0.05,
                 "significant_at_0_05": p_value < 0.05,
+                "effect_direction": "HGCR_better" if avg_gap < 0 else "baseline_better_or_tie",
             }
         )
     return rows
@@ -272,10 +291,13 @@ def arpd_summary(detail: Sequence[dict], rank_rows: Sequence[dict], wtl_rows: Se
                 "method": method,
                 "ARPD_mean": mean(vals),
                 "ARPD_std": pstdev(vals) if len(vals) > 1 else 0.0,
+                "rank_mean": fnum(rank.get("mean_rank")),
+                "rank_std": 0.0,
                 "mean_rank": fnum(rank.get("mean_rank")),
                 "rank1_count": rank.get("rank1_count", 0),
                 "top3_count": rank.get("top3_count", 0),
                 "win_rate_vs_HGCR": "" if method == "HGCR-PPO" else fnum(wtl.get("loss_rate")),
+                "n_instances": len(vals),
             }
         )
     return out
@@ -363,13 +385,13 @@ def run(args):
         print(f"No-write enabled: read {len(detail)} detail rows, no files written.")
         return paths
     write_csv(paths["detail"], detail, list(detail[0].keys()) if detail else [])
-    write_csv(paths["summary"], summary, ["arrival_intensity", "carryover_ratio", "reward_beta", "seed", "method", "Cmax_mean", "Cmax_std", "Cmax_min", "Cmax_max", "instance_count"])
+    write_csv(paths["summary"], summary, ["arrival_intensity", "carryover_ratio", "reward_beta", "seed", "method", "Cmax_mean", "Cmax_std", "Cmax_min", "Cmax_max", "average_completion_time_mean", "average_waiting_time_mean", "machine_utilization_mean", "load_balance_std_mean", "runtime_seconds_mean", "valid_schedule_rate", "instance_count", "n_instances"])
     write_csv(paths["wtl"], wtl, ["baseline_method", "win_count", "tie_count", "loss_count", "win_rate", "tie_rate", "loss_rate", "mean_gap", "median_gap"])
     write_csv(paths["rank"], rank, ["method", "mean_rank", "median_rank", "rank1_count", "top2_count", "top3_count", "instance_count"])
     write_csv(paths["heatmap"], heatmap, ["arrival_intensity", "carryover_ratio", "HGCR_PPO_Cmax_mean", "FIFO_Cmax_mean", "MLPRanker_Cmax_mean", "HGCR_improvement_over_FIFO", "HGCR_improvement_over_MLP", "HGCR_mean_rank"])
     write_csv(paths["action_perf"], action_perf, ["arrival_intensity", "carryover_ratio", "seed", "FIFO_ratio", "GreedyECT_ratio", "Lookahead_ratio", "MLPRanker_ratio", "HGCR_Cmax", "FIFO_Cmax", "MLPRanker_Cmax", "HGCR_relative_to_FIFO", "HGCR_relative_to_MLP"])
-    write_csv(paths["significance"], sig, ["method", "n_pairs", "mean_gap", "median_gap", "p_value", "significant_at_0_05"])
-    write_csv(paths["arpd"], arpd, ["method", "ARPD_mean", "ARPD_std", "mean_rank", "rank1_count", "top3_count", "win_rate_vs_HGCR"])
+    write_csv(paths["significance"], sig, ["comparison", "baseline_method", "method", "test_name", "n_pairs", "mean_diff", "median_diff", "mean_gap", "median_gap", "p_value", "significant", "significant_at_0_05", "effect_direction"])
+    write_csv(paths["arpd"], arpd, ["method", "arrival_intensity", "carryover_ratio", "reward_beta", "ARPD_mean", "ARPD_std", "rank_mean", "rank_std", "mean_rank", "rank1_count", "top3_count", "win_rate_vs_HGCR", "n_instances"])
     paths["report"].parent.mkdir(parents=True, exist_ok=True)
     paths["report"].write_text(report_text(detail, summary, wtl, rank, heatmap, action_perf, sig, arpd), encoding="utf-8")
     print(f"Saved Stage G paper results to {args.output_dir}")

@@ -15,6 +15,7 @@ OUTPUT_DIR = Path("data/results/stage_G/paper_figures")
 HGCR_RUNS_DIR = Path("data/results/stage_G/hgcr_dynamic_ppo/runs")
 GANTT_DIR = Path("data/results/stage_G/gantt_cases")
 METHOD_ORDER = ["Random", "SPT", "LPT", "MinLoad", "GreedyECT", "Lookahead", "FIFO", "MLP-Ranker", "HGCR-PPO"]
+MAIN_METHODS = ["FIFO", "GreedyECT", "Lookahead", "MLP-Ranker", "HGCR-PPO"]
 ARRIVAL_ORDER = ["low", "medium", "high"]
 RULES = ["FIFO", "GreedyECT", "Lookahead", "MLP-Ranker"]
 
@@ -86,24 +87,26 @@ def fig_g1(data, out_dir, no_write):
     import numpy as np
 
     plt = mpl()
-    fig, ax = plt.subplots(figsize=(8.8, 3.8))
+    carryovers = ["low", "medium", "high"]
+    fig, axes = plt.subplots(1, 3, figsize=(10.8, 3.2), sharey=True)
     x = np.arange(len(ARRIVAL_ORDER))
-    for method in METHOD_ORDER:
-        y = []
-        err = []
-        for arrival in ARRIVAL_ORDER:
-            vals = [row for row in rows if row.get("arrival_intensity") == arrival and row.get("method") == method]
-            y.append(sum(fnum(row.get("Cmax_mean")) for row in vals) / len(vals) if vals else float("nan"))
-            err.append(sum(fnum(row.get("Cmax_std")) for row in vals) / len(vals) if vals else 0.0)
-        ax.errorbar(x, y, yerr=err, marker="o", linewidth=1.2, capsize=2.5, label=method)
-    ax.set_xticks(x)
-    ax.set_xticklabels(ARRIVAL_ORDER)
-    ax.set_ylabel("Cmax mean")
-    ax.set_xlabel("Arrival intensity")
-    ax.legend(frameon=False, ncol=3, bbox_to_anchor=(0.5, 1.28), loc="upper center")
-    ax.grid(axis="y", alpha=0.25)
+    for ax, carryover in zip(axes, carryovers):
+        for method in MAIN_METHODS:
+            y, err = [], []
+            for arrival in ARRIVAL_ORDER:
+                vals = [row for row in rows if row.get("arrival_intensity") == arrival and row.get("carryover_ratio") == carryover and row.get("method") == method]
+                y.append(sum(fnum(row.get("Cmax_mean")) for row in vals) / len(vals) if vals else float("nan"))
+                err.append(sum(fnum(row.get("Cmax_std")) for row in vals) / len(vals) if vals else 0.0)
+            ax.errorbar(x, y, yerr=err, marker="o", linewidth=1.2, capsize=2.5, label=method)
+        ax.set_xticks(x)
+        ax.set_xticklabels(ARRIVAL_ORDER)
+        ax.set_title(f"carryover={carryover}")
+        ax.grid(axis="y", alpha=0.25)
+    axes[0].set_ylabel("Cmax mean")
+    axes[1].set_xlabel("Arrival intensity")
+    axes[1].legend(frameon=False, ncol=5, bbox_to_anchor=(0.5, 1.28), loc="upper center")
     fig.tight_layout()
-    save(fig, out_dir, "fig_G1_multi_method_cmax_by_arrival", no_write)
+    save(fig, out_dir, "Fig_G1_multi_scenario_method_comparison", no_write)
     plt.close(fig)
 
 
@@ -113,16 +116,28 @@ def fig_g2(data, out_dir, no_write):
         print("Warning: skip G2, missing detail.")
         return
     plt = mpl()
-    grouped = [[fnum(row["Cmax"]) for row in rows if row.get("method") == method] for method in METHOD_ORDER]
-    labels = [method for method, vals in zip(METHOD_ORDER, grouped) if vals]
-    values = [vals for vals in grouped if vals]
+    best_by_instance = {}
+    for row in rows:
+        key = (row["scenario_run_id"], row["instance_id"])
+        best_by_instance[key] = min(best_by_instance.get(key, float("inf")), fnum(row["Cmax"]))
+    labels, values = [], []
+    for method in ["FIFO", "GreedyECT", "Lookahead", "MinLoad", "MLP-Ranker", "HGCR-PPO"]:
+        vals = []
+        for row in rows:
+            if row.get("method") != method:
+                continue
+            best = best_by_instance[(row["scenario_run_id"], row["instance_id"])]
+            vals.append((fnum(row["Cmax"]) - best) / max(best, 1e-8) * 100.0)
+        if vals:
+            labels.append(method)
+            values.append(vals)
     fig, ax = plt.subplots(figsize=(8.0, 3.8))
     ax.boxplot(values, labels=labels, showfliers=False)
-    ax.set_ylabel("Per-instance Cmax")
+    ax.set_ylabel("ARPD (%)")
     ax.tick_params(axis="x", rotation=25)
     ax.grid(axis="y", alpha=0.25)
     fig.tight_layout()
-    save(fig, out_dir, "fig_G2_method_boxplot_cmax", no_write)
+    save(fig, out_dir, "Fig_G2_arpd_boxplot", no_write)
     plt.close(fig)
 
 
@@ -149,7 +164,7 @@ def fig_g3(data, out_dir, no_write):
     ax.set_xlabel("Rate")
     ax.legend(frameon=False, ncol=3, loc="lower center", bbox_to_anchor=(0.5, 1.02))
     fig.tight_layout()
-    save(fig, out_dir, "fig_G3_win_tie_loss", no_write)
+    save(fig, out_dir, "Fig_G3_win_tie_loss", no_write)
     plt.close(fig)
 
 
@@ -164,27 +179,32 @@ def fig_g4(data, out_dir, no_write):
     import numpy as np
 
     plt = mpl()
-    matrix = np.full((len(ARRIVAL_ORDER), len(carryovers)), np.nan)
+    matrix_mlp = np.full((len(ARRIVAL_ORDER), len(carryovers)), np.nan)
+    matrix_fifo = np.full((len(ARRIVAL_ORDER), len(carryovers)), np.nan)
     for row in rows:
         if row["arrival_intensity"] in ARRIVAL_ORDER:
             r = ARRIVAL_ORDER.index(row["arrival_intensity"])
             c = carryovers.index(row["carryover_ratio"])
-            matrix[r, c] = fnum(row["HGCR_improvement_over_MLP"]) * 100.0
-    fig, ax = plt.subplots(figsize=(4.2, 3.2))
-    im = ax.imshow(matrix, cmap="Blues", aspect="auto")
-    ax.set_xticks(range(len(carryovers)))
-    ax.set_xticklabels(carryovers)
-    ax.set_yticks(range(len(ARRIVAL_ORDER)))
-    ax.set_yticklabels(ARRIVAL_ORDER)
-    ax.set_xlabel("Carryover ratio")
-    ax.set_ylabel("Arrival intensity")
-    for i in range(matrix.shape[0]):
-        for j in range(matrix.shape[1]):
-            if not np.isnan(matrix[i, j]):
-                ax.text(j, i, f"{matrix[i, j]:.1f}%", ha="center", va="center", fontsize=8)
-    fig.colorbar(im, ax=ax, label="Improvement over MLP-Ranker (%)")
+            matrix_mlp[r, c] = fnum(row["HGCR_improvement_over_MLP"]) * 100.0
+            matrix_fifo[r, c] = fnum(row["HGCR_improvement_over_FIFO"]) * 100.0
+    vmax = np.nanmax(np.abs([matrix_fifo, matrix_mlp])) if not np.isnan(np.nanmax(np.abs([matrix_fifo, matrix_mlp]))) else 1.0
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), sharey=True)
+    for ax, matrix, title in [(axes[0], matrix_fifo, "vs FIFO"), (axes[1], matrix_mlp, "vs MLP-Ranker")]:
+        im = ax.imshow(matrix, cmap="coolwarm", aspect="auto", vmin=-vmax, vmax=vmax)
+        ax.set_title(title)
+        ax.set_xticks(range(len(carryovers)))
+        ax.set_xticklabels(carryovers)
+        ax.set_yticks(range(len(ARRIVAL_ORDER)))
+        ax.set_yticklabels(ARRIVAL_ORDER)
+        ax.set_xlabel("Carryover ratio")
+        for i in range(matrix.shape[0]):
+            for j in range(matrix.shape[1]):
+                if not np.isnan(matrix[i, j]):
+                    ax.text(j, i, f"{matrix[i, j]:.1f}%", ha="center", va="center", fontsize=8)
+    axes[0].set_ylabel("Arrival intensity")
+    fig.colorbar(im, ax=axes.ravel().tolist(), label="Improvement (%)")
     fig.tight_layout()
-    save(fig, out_dir, "fig_G4_dynamic_scenario_heatmap", no_write)
+    save(fig, out_dir, "Fig_G4_dynamic_scenario_heatmap", no_write)
     plt.close(fig)
 
 
@@ -226,7 +246,7 @@ def fig_g5(data, out_dir, no_write):
     axes[1].set_xticklabels(labels, rotation=25, ha="right")
     axes[1].legend(frameon=False, ncol=4, loc="upper center", bbox_to_anchor=(0.5, 1.18))
     fig.tight_layout()
-    save(fig, out_dir, "fig_G5_action_performance_panel", no_write)
+    save(fig, out_dir, "Fig_G5_action_performance_panel", no_write)
     plt.close(fig)
 
 
@@ -236,7 +256,7 @@ def fig_g6(data, out_dir, no_write):
     if not cases:
         print("Warning: skip G6, no generated Gantt case comparison found.")
         return
-    print(f"Use existing Gantt case for G6: {cases[-1]}")
+    print(f"Use existing Gantt case for Fig_G6_gantt_case_comparison: {cases[-1]}")
 
 
 def eval_history_rows(root: Path) -> List[dict]:
@@ -266,7 +286,7 @@ def fig_s1(data, out_dir, no_write):
     ax.set_ylabel("Cmax mean")
     ax.legend(frameon=False)
     fig.tight_layout()
-    save(fig, out_dir, "fig_S1_reward_beta_sensitivity", no_write)
+    save(fig, out_dir, "Fig_S1_reward_beta_sensitivity", no_write)
     plt.close(fig)
 
 
@@ -279,8 +299,8 @@ def fig_s2_s3(data, out_dir, no_write):
 
     plt = mpl()
     for metric, stem, ylabel in [
-        ("eval_Cmax_mean", "fig_S2_training_convergence_cmax", "Eval Cmax mean"),
-        ("eval_reward_mean", "fig_S3_training_convergence_reward", "Eval reward mean"),
+        ("eval_Cmax_mean", "Fig_S2_eval_cmax_convergence", "Eval Cmax mean"),
+        ("eval_reward_mean", "Fig_S3_eval_reward_convergence", "Eval reward mean"),
     ]:
         fig, ax = plt.subplots(figsize=(4.8, 3.0))
         by_seed = {}
@@ -325,7 +345,7 @@ def fig_s4(data, out_dir, no_write):
     ax.set_ylabel("ARPD mean (%)")
     ax.tick_params(axis="x", rotation=25)
     fig.tight_layout()
-    save(fig, out_dir, "fig_S4_method_rank_or_arpd", no_write)
+    save(fig, out_dir, "Fig_S4_arpd_rank_significance", no_write)
     plt.close(fig)
 
 

@@ -162,13 +162,17 @@ def output_paths(args, run_id: str) -> Dict[str, Path]:
     # Keep the full metadata-rich run_id in the directory name and manifest.
     # Repeating it in every filename can exceed Windows' traditional MAX_PATH
     # limit on user workstations with deep project paths.
+    preferred_eval_history = run_dir / f"eval_history__{run_id}.csv"
+    eval_history_path = preferred_eval_history
+    if len(str(preferred_eval_history.resolve())) > 240:
+        eval_history_path = run_dir / "eval_history.csv"
     return {
         "run_dir": run_dir,
         "train": run_dir / "train_log.csv",
         "eval_summary": run_dir / "eval_summary.csv",
         "action_ratio": run_dir / "action_ratio.csv",
         "curve": run_dir / "reward_cmax_curve.csv",
-        "eval_history": run_dir / "eval_history.csv",
+        "eval_history": eval_history_path,
         "manifest": run_dir / "manifest.json",
         "checkpoint": run_dir / "hgcr_dynamic_ppo.pt",
     }
@@ -531,6 +535,7 @@ def run(args) -> Path:
                 "ranker_loaded": ranker_model is not None,
                 "best_eval_Cmax_mean": best_cmax,
                 "output_files": {key: str(value) for key, value in paths.items() if key != "run_dir"},
+                "eval_history_path": str(paths["eval_history"]),
                 "python_version": sys.version,
             },
             indent=2,

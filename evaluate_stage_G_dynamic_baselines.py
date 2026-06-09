@@ -33,7 +33,7 @@ from src.evaluation.metrics import compute_metrics
 
 
 RUNS_DIR = Path("data/results/stage_G/hgcr_dynamic_ppo/runs")
-OUTPUT_DIR = Path("data/results/stage_G/baseline_eval")
+OUTPUT_DIR = Path("data/results/stage_G/paper_results")
 DEFAULT_METHODS = ["Random", "SPT", "LPT", "FIFO", "GreedyECT", "Lookahead", "MinLoad", "MLP-Ranker", "HGCR-PPO"]
 DETAIL_FIELDS = [
     "scenario_run_id",
@@ -321,11 +321,17 @@ def write_csv(path: Path, rows: Iterable[dict], fields: Sequence[str]) -> None:
 def run(args) -> Path | None:
     selected = select_stage_g_runs(Path(args.runs_dir), args.max_runs)
     eval_id = run_id()
-    out_dir = Path(args.output_dir) / "runs" / eval_id
+    out_dir = Path(args.output_dir)
     print(f"Selected Stage G runs: {len(selected)}")
     for run_dir, manifest in selected:
         print(f"  - {manifest.get('run_id')} from {run_dir}")
-    print(f"Planned output dir: {out_dir}")
+    detail_path = out_dir / f"stage_G_method_comparison_detail__{eval_id}.csv"
+    summary_path = out_dir / f"stage_G_method_comparison_summary_raw__{eval_id}.csv"
+    trace_path = out_dir / f"schedule_trace__{eval_id}.csv"
+    print(f"Planned detail output: {detail_path}")
+    print(f"Planned summary output: {summary_path}")
+    if args.save_schedule_trace:
+        print(f"Planned schedule trace output: {trace_path}")
     if args.dry_run:
         print("Dry run enabled: no baseline evaluation will be executed and no files will be written.")
         return out_dir
@@ -369,10 +375,10 @@ def run(args) -> Path | None:
     if args.no_write:
         print(f"No-write enabled: evaluated {len(detail_rows)} detail rows and {len(trace_rows)} trace rows, no files written.")
         return out_dir
-    write_csv(out_dir / f"baseline_eval_detail__{eval_id}.csv", detail_rows, DETAIL_FIELDS)
-    write_csv(out_dir / f"baseline_eval_summary__{eval_id}.csv", summary_rows, SUMMARY_FIELDS)
+    write_csv(detail_path, detail_rows, DETAIL_FIELDS)
+    write_csv(summary_path, summary_rows, SUMMARY_FIELDS)
     if args.save_schedule_trace:
-        write_csv(out_dir / f"schedule_trace__{eval_id}.csv", trace_rows, TRACE_FIELDS)
+        write_csv(trace_path, trace_rows, TRACE_FIELDS)
     (out_dir / f"manifest__{eval_id}.json").write_text(
         json.dumps({"run_id": eval_id, "stage": "G", "args": vars(args), "source_runs": [m["run_id"] for _, m in selected]}, indent=2),
         encoding="utf-8",

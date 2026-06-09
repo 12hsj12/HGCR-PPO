@@ -37,6 +37,13 @@ python run_hgcr_dynamic_ppo.py --size small --top_k 5 --episodes 5000 --seed 0 -
 python evaluate_stage_G_dynamic_baselines.py --methods Random SPT LPT FIFO GreedyECT Lookahead MinLoad MLP-Ranker HGCR-PPO --save_schedule_trace
 ```
 
+输出到：
+
+```text
+data/results/stage_G/paper_results/stage_G_method_comparison_detail__*.csv
+data/results/stage_G/paper_results/schedule_trace__*.csv
+```
+
 ## C. 汇总
 
 ```powershell
