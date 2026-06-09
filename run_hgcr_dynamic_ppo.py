@@ -295,6 +295,7 @@ def run_episode(model, scenario: dict, args, ranker_model, device, train_mode: b
     env = reset_env_for_scenario(scenario)
     buffer = PPOBuffer()
     counts = Counter()
+    action_sequence = []
     step_reward_sum = 0.0
     old_util = current_utilization(env)
     while not env.is_done():
