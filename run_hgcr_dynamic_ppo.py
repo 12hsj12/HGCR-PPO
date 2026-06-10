@@ -58,6 +58,7 @@ TRAIN_FIELDS = [
 EVAL_HISTORY_FIELDS = [
     "eval_step",
     "episode",
+    "size",
     "seed",
     "arrival_intensity",
     "carryover_ratio",
@@ -73,6 +74,7 @@ EVAL_HISTORY_FIELDS = [
 EVAL_FIELDS = [
     "method",
     "scenario_type",
+    "size",
     "arrival_intensity",
     "carryover_ratio",
     "Cmax_mean",
@@ -84,8 +86,9 @@ EVAL_FIELDS = [
 ]
 ACTION_FIELDS = ["rule_name", "selection_count", "selection_ratio"]
 CURVE_FIELDS = ["episode", "episode_reward", "episode_Cmax", "step_reward_sum", "final_reward", "total_reward"]
-ACTION_HISTORY_FIELDS = ["episode", "decision_index", "seed", "arrival_intensity", "carryover_ratio", "reward_beta", "action_id", "action_name", "is_eval"]
-ACTION_STAGE_FIELDS = ["stage_start_episode", "stage_end_episode", "seed", "arrival_intensity", "carryover_ratio", "reward_beta", "action_name", "action_count", "action_ratio"]
+ACTION_HISTORY_FIELDS = ["episode", "decision_index", "size", "seed", "arrival_intensity", "carryover_ratio", "reward_beta", "action_id", "action_name", "is_eval"]
+ACTION_STAGE_FIELDS = ["stage_start_episode", "stage_end_episode", "size", "seed", "arrival_intensity", "carryover_ratio", "reward_beta", "action_name", "action_count", "action_ratio"]
+ACTION_DISPLAY_NAMES = {"MLP_Ranker_soft_ce": "MLP-Ranker"}
 
 
 @dataclass
@@ -406,8 +409,9 @@ def evaluate_all(model, scenarios, args, ranker_model, device) -> List[dict]:
     rows = []
     for method in methods:
         row = {
-            "method": method,
+            "method": ACTION_DISPLAY_NAMES.get(method, method),
             "scenario_type": "dynamic",
+            "size": args.size,
             "arrival_intensity": args.arrival_intensity,
             "carryover_ratio": args.carryover_ratio,
             **raw[method],
@@ -420,7 +424,7 @@ def evaluate_all(model, scenarios, args, ranker_model, device) -> List[dict]:
 
 def action_ratio_rows(counts: Counter) -> List[dict]:
     total = max(1, sum(counts.values()))
-    return [{"rule_name": rule, "selection_count": counts[rule], "selection_ratio": counts[rule] / total} for rule in RULE_NAMES]
+    return [{"rule_name": ACTION_DISPLAY_NAMES.get(rule, rule), "selection_count": counts[rule], "selection_ratio": counts[rule] / total} for rule in RULE_NAMES]
 
 
 def action_stage_rows(action_history_rows: List[dict], args) -> List[dict]:
@@ -437,6 +441,7 @@ def action_stage_rows(action_history_rows: List[dict], args) -> List[dict]:
                 {
                     "stage_start_episode": start,
                     "stage_end_episode": end,
+                    "size": args.size,
                     "seed": args.seed,
                     "arrival_intensity": args.arrival_intensity,
                     "carryover_ratio": args.carryover_ratio,
@@ -494,65 +499,93 @@ def run(args) -> Path:
     best_cmax = float("inf")
     best_state = None
     bad_evals = 0
-    for episode in progress_iter(range(1, args.episodes + 1), desc="hgcr-dynamic-ppo train", total=args.episodes):
-        scenario = scenarios[(episode - 1) % len(scenarios)]
-        _, ep_buffer, counts, actions, ep = run_episode(model, scenario, args, ranker_model, device, train_mode=True)
-        for idx in range(len(ep_buffer)):
-            buffer.add(ep_buffer.states[idx], ep_buffer.actions[idx], ep_buffer.logprobs[idx], ep_buffer.rewards[idx], ep_buffer.values[idx], ep_buffer.dones[idx])
-        action_counts.update(counts)
-        for decision_idx, (action_id, action_name) in enumerate(actions, start=1):
-            action_history_rows.append(
+    completed_episodes = 0
+    early_stopped = False
+    try:
+        for episode in progress_iter(range(1, args.episodes + 1), desc="hgcr-dynamic-ppo train", total=args.episodes):
+            completed_episodes = episode
+            scenario = scenarios[(episode - 1) % len(scenarios)]
+            _, ep_buffer, counts, actions, ep = run_episode(model, scenario, args, ranker_model, device, train_mode=True)
+            for idx in range(len(ep_buffer)):
+                buffer.add(ep_buffer.states[idx], ep_buffer.actions[idx], ep_buffer.logprobs[idx], ep_buffer.rewards[idx], ep_buffer.values[idx], ep_buffer.dones[idx])
+            action_counts.update(counts)
+            for decision_idx, (action_id, action_name) in enumerate(actions, start=1):
+                action_history_rows.append(
+                    {
+                        "episode": episode,
+                        "decision_index": decision_idx,
+                        "size": args.size,
+                        "seed": args.seed,
+                        "arrival_intensity": args.arrival_intensity,
+                        "carryover_ratio": args.carryover_ratio,
+                        "reward_beta": args.reward_beta,
+                        "action_id": action_id,
+                        "action_name": ACTION_DISPLAY_NAMES.get(action_name, action_name),
+                        "is_eval": False,
+                    }
+                )
+            stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "approx_kl": 0.0}
+            if len(buffer) >= args.batch_size or episode == args.episodes:
+                stats = update(model, optimizer, buffer, args, device)
+                buffer.clear()
+            if episode % max(1, args.eval_interval) == 0 or episode == args.episodes:
+                eval_rows = evaluate_all(model, eval_scenarios, args, ranker_model, device)
+                hgcr_row = next(row for row in eval_rows if row["method"] == "HGCR-PPO")
+                fifo_row = next(row for row in eval_rows if row["method"] == "FIFO")
+                mlp_row = next(row for row in eval_rows if row["method"] == "MLP-Ranker")
+                hgcr_cmax = hgcr_row["Cmax_mean"]
+                if hgcr_cmax < best_cmax:
+                    best_cmax = hgcr_cmax
+                    best_state = deepcopy(model.state_dict())
+                    bad_evals = 0
+                else:
+                    bad_evals += 1
+                eval_history_rows.append(
+                    {
+                        "eval_step": len(eval_history_rows) + 1,
+                        "episode": episode,
+                        "size": args.size,
+                        "seed": args.seed,
+                        "arrival_intensity": args.arrival_intensity,
+                        "carryover_ratio": args.carryover_ratio,
+                        "reward_beta": args.reward_beta,
+                        "eval_Cmax_mean": hgcr_row["Cmax_mean"],
+                        "eval_Cmax_std": hgcr_row["Cmax_std"],
+                        "eval_reward_mean": hgcr_row["reward_mean"],
+                        "eval_reward_std": hgcr_row["reward_std"],
+                        "best_so_far_Cmax": best_cmax,
+                        "baseline_FIFO_Cmax": fifo_row["Cmax_mean"],
+                        "baseline_MLPRanker_Cmax": mlp_row["Cmax_mean"],
+                    }
+                )
+            row = {"episode": episode, **ep, **stats, "is_eval_step": bool(eval_history_rows and eval_history_rows[-1]["episode"] == episode)}
+            train_rows.append(row)
+            curve_rows.append({key: row[key] for key in CURVE_FIELDS})
+            if bad_evals >= args.early_stop_patience and not args.smoke_test and not args.disable_early_stop:
+                early_stopped = True
+                print(f"Early stop at episode {episode}: no Cmax improvement for {bad_evals} eval checks.")
+                break
+    except Exception as exc:
+        paths["manifest"].write_text(
+            json.dumps(
                 {
-                    "episode": episode,
-                    "decision_index": decision_idx,
-                    "seed": args.seed,
-                    "arrival_intensity": args.arrival_intensity,
-                    "carryover_ratio": args.carryover_ratio,
-                    "reward_beta": args.reward_beta,
-                    "action_id": action_id,
-                    "action_name": "MLP-Ranker" if action_name == "MLP_Ranker_soft_ce" else action_name,
-                    "is_eval": False,
-                }
-            )
-        stats = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "approx_kl": 0.0}
-        if len(buffer) >= args.batch_size or episode == args.episodes:
-            stats = update(model, optimizer, buffer, args, device)
-            buffer.clear()
-        if episode % max(1, args.eval_interval) == 0 or episode == args.episodes:
-            eval_rows = evaluate_all(model, eval_scenarios, args, ranker_model, device)
-            hgcr_row = next(row for row in eval_rows if row["method"] == "HGCR-PPO")
-            fifo_row = next(row for row in eval_rows if row["method"] == "FIFO")
-            mlp_row = next(row for row in eval_rows if row["method"] == "MLP_Ranker_soft_ce")
-            hgcr_cmax = hgcr_row["Cmax_mean"]
-            if hgcr_cmax < best_cmax:
-                best_cmax = hgcr_cmax
-                best_state = deepcopy(model.state_dict())
-                bad_evals = 0
-            else:
-                bad_evals += 1
-            eval_history_rows.append(
-                {
-                    "eval_step": len(eval_history_rows) + 1,
-                    "episode": episode,
-                    "seed": args.seed,
-                    "arrival_intensity": args.arrival_intensity,
-                    "carryover_ratio": args.carryover_ratio,
-                    "reward_beta": args.reward_beta,
-                    "eval_Cmax_mean": hgcr_row["Cmax_mean"],
-                    "eval_Cmax_std": hgcr_row["Cmax_std"],
-                    "eval_reward_mean": hgcr_row["reward_mean"],
-                    "eval_reward_std": hgcr_row["reward_std"],
-                    "best_so_far_Cmax": best_cmax,
-                    "baseline_FIFO_Cmax": fifo_row["Cmax_mean"],
-                    "baseline_MLPRanker_Cmax": mlp_row["Cmax_mean"],
-                }
-            )
-        row = {"episode": episode, **ep, **stats, "is_eval_step": bool(eval_history_rows and eval_history_rows[-1]["episode"] == episode)}
-        train_rows.append(row)
-        curve_rows.append({key: row[key] for key in CURVE_FIELDS})
-        if bad_evals >= args.early_stop_patience and not args.smoke_test:
-            print(f"Early stop at episode {episode}: no Cmax improvement for {bad_evals} eval checks.")
-            break
+                    "stage": "G",
+                    "experiment_family": "hgcr_dynamic_ppo",
+                    "scenario_type": "dynamic_rolling",
+                    "size": args.size,
+                    "episodes": args.episodes,
+                    "completed_episodes": completed_episodes,
+                    "failed": True,
+                    "failure_message": f"{type(exc).__name__}: {exc}",
+                    "run_id": run_id,
+                    "args": vars(args),
+                    "python_version": sys.version,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        raise
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -574,6 +607,10 @@ def run(args) -> Path:
                 "size": args.size,
                 "top_k": args.top_k,
                 "episodes": args.episodes,
+                "completed_episodes": completed_episodes,
+                "early_stopped": early_stopped,
+                "failed": False,
+                "disable_early_stop": args.disable_early_stop,
                 "seed": args.seed,
                 "arrival_intensity": args.arrival_intensity,
                 "carryover_ratio": args.carryover_ratio,
@@ -628,6 +665,7 @@ def main() -> None:
     parser.add_argument("--update_epochs", type=int, default=10)
     parser.add_argument("--eval_interval", type=int, default=250)
     parser.add_argument("--early_stop_patience", type=int, default=10)
+    parser.add_argument("--disable_early_stop", action="store_true")
     parser.add_argument("--num_scenarios", type=int, default=200)
     parser.add_argument("--eval_scenarios", type=int, default=50)
     parser.add_argument("--action_stage_episodes", type=int, default=1000)

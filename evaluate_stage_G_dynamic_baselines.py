@@ -37,12 +37,14 @@ OUTPUT_DIR = Path("data/results/stage_G/paper_results")
 DEFAULT_METHODS = ["Random", "SPT", "LPT", "FIFO", "GreedyECT", "Lookahead", "MinLoad", "MLP-Ranker", "HGCR-PPO"]
 DETAIL_FIELDS = [
     "scenario_run_id",
+    "size",
     "arrival_intensity",
     "carryover_ratio",
     "reward_beta",
     "seed",
     "instance_id",
     "case_id",
+    "case_label",
     "method",
     "Cmax",
     "average_completion_time",
@@ -53,6 +55,7 @@ DETAIL_FIELDS = [
     "valid_schedule",
 ]
 SUMMARY_FIELDS = [
+    "size",
     "arrival_intensity",
     "carryover_ratio",
     "reward_beta",
@@ -71,11 +74,14 @@ SUMMARY_FIELDS = [
 ]
 TRACE_FIELDS = [
     "scenario_run_id",
+    "size",
     "arrival_intensity",
     "carryover_ratio",
     "reward_beta",
     "seed",
     "instance_id",
+    "case_id",
+    "case_label",
     "method",
     "job_id",
     "batch_id",
@@ -233,18 +239,24 @@ def rollout_hgcr(scenario: dict, model, ranker_model, manifest: dict, device: st
     return env, time.perf_counter() - start
 
 
-def detail_row(run_manifest: dict, scenario: dict, method: str, env, runtime: float) -> dict:
+def scenario_case_id(run_manifest: dict, scenario: dict) -> str:
+    return f"{run_manifest['size']}-{run_manifest['arrival_intensity']}-{run_manifest['carryover_ratio']}-seed{run_manifest['seed']}-inst{scenario['scenario_id']}"
+
+
+def detail_row(run_manifest: dict, scenario: dict, method: str, env, runtime: float, case_label: str) -> dict:
     metrics = compute_metrics(env)
     valid = validate_schedule(env, scenario["instance"])["is_valid_schedule"]
-    case_id = f"{run_manifest['arrival_intensity']}-{run_manifest['carryover_ratio']}-seed{run_manifest['seed']}-inst{scenario['scenario_id']}"
+    case_id = scenario_case_id(run_manifest, scenario)
     return {
         "scenario_run_id": run_manifest["run_id"],
+        "size": run_manifest["size"],
         "arrival_intensity": run_manifest["arrival_intensity"],
         "carryover_ratio": run_manifest["carryover_ratio"],
         "reward_beta": run_manifest["reward_beta"],
         "seed": run_manifest["seed"],
         "instance_id": scenario["scenario_id"],
         "case_id": case_id,
+        "case_label": case_label,
         "method": "MinLoad" if method == "MinCandidateLoad" else method,
         "Cmax": metrics["Cmax_roll"],
         "average_completion_time": metrics["average_completion_time"],
@@ -256,18 +268,22 @@ def detail_row(run_manifest: dict, scenario: dict, method: str, env, runtime: fl
     }
 
 
-def schedule_trace_rows(run_manifest: dict, scenario: dict, method: str, env) -> List[dict]:
+def schedule_trace_rows(run_manifest: dict, scenario: dict, method: str, env, case_label: str) -> List[dict]:
     period = float(getattr(scenario["instance"], "rolling_period_length", 1.0) or 1.0)
+    case_id = scenario_case_id(run_manifest, scenario)
     rows = []
     for subtask in env.subtasks:
         rows.append(
             {
                 "scenario_run_id": run_manifest["run_id"],
+                "size": run_manifest["size"],
                 "arrival_intensity": run_manifest["arrival_intensity"],
                 "carryover_ratio": run_manifest["carryover_ratio"],
                 "reward_beta": run_manifest["reward_beta"],
                 "seed": run_manifest["seed"],
                 "instance_id": scenario["scenario_id"],
+                "case_id": case_id,
+                "case_label": case_label,
                 "method": method,
                 "job_id": subtask.job_id,
                 "batch_id": scenario["scenario_id"],
@@ -286,13 +302,14 @@ def schedule_trace_rows(run_manifest: dict, scenario: dict, method: str, env) ->
 def summarize(rows: Sequence[dict]) -> List[dict]:
     groups: Dict[tuple, List[dict]] = {}
     for row in rows:
-        key = (row["arrival_intensity"], row["carryover_ratio"], row["reward_beta"], row["seed"], row["method"])
+        key = (row["size"], row["arrival_intensity"], row["carryover_ratio"], row["reward_beta"], row["seed"], row["method"])
         groups.setdefault(key, []).append(row)
     out = []
-    for (arrival, carryover, beta, seed, method), vals in sorted(groups.items()):
+    for (size, arrival, carryover, beta, seed, method), vals in sorted(groups.items()):
         cmax = [float(row["Cmax"]) for row in vals]
         out.append(
             {
+                "size": size,
                 "arrival_intensity": arrival,
                 "carryover_ratio": carryover,
                 "reward_beta": beta,
@@ -344,6 +361,7 @@ def run(args) -> Path | None:
     ranker_model = None if "MLP-Ranker" not in methods else load_ranker(args.ranker_ckpt, device)
     detail_rows: List[dict] = []
     trace_rows: List[dict] = []
+    case_labels: Dict[str, str] = {}
     for run_dir, manifest in selected:
         from dynamic_rolling_scenarios import generate_dynamic_scenarios
 
@@ -362,6 +380,8 @@ def run(args) -> Path | None:
         if "HGCR-PPO" in methods:
             hgcr_model, hgcr_ranker = load_hgcr_policy(run_dir, manifest, device)
         for scenario in scenarios:
+            cid = scenario_case_id(manifest, scenario)
+            case_label = case_labels.setdefault(cid, f"C{len(case_labels) + 1}")
             for method in methods:
                 if method == "HGCR-PPO":
                     if hgcr_model is None:
@@ -370,9 +390,9 @@ def run(args) -> Path | None:
                 else:
                     canonical = "MinCandidateLoad" if method == "MinLoad" else method
                     env, runtime = rollout_rule(scenario, canonical, int(manifest["seed"]), ranker_model=ranker_model, device=device, top_k=int(manifest["top_k"]))
-                detail_rows.append(detail_row(manifest, scenario, method, env, runtime))
+                detail_rows.append(detail_row(manifest, scenario, method, env, runtime, case_label))
                 if args.save_schedule_trace:
-                    trace_rows.extend(schedule_trace_rows(manifest, scenario, method, env))
+                    trace_rows.extend(schedule_trace_rows(manifest, scenario, method, env, case_label))
 
     summary_rows = summarize(detail_rows)
     if args.no_write:

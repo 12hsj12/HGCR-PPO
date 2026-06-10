@@ -31,6 +31,8 @@ def paths(output_dir: Path, suffix: str) -> Dict[str, Path]:
         "arpd": output_dir / f"stage_G_arpd_summary_v2__{suffix}.csv",
         "sig": output_dir / f"stage_G_significance_tests_v2__{suffix}.csv",
         "case": output_dir / f"stage_G_case_curve_detail_v2__{suffix}.csv",
+        "scale": output_dir / f"stage_G_scale_summary_v2__{suffix}.csv",
+        "case_mapping": output_dir / f"stage_G_case_mapping_v2__{suffix}.csv",
     }
 
 
@@ -66,19 +68,24 @@ def collect_detail(root: Path) -> List[dict]:
 
 
 def case_id(row: dict) -> str:
-    return row.get("case_id") or f"{row.get('arrival_intensity')}-{row.get('carryover_ratio')}-seed{row.get('seed')}-inst{row.get('instance_id')}"
+    return row.get("case_id") or f"{row.get('size', 'unknown')}-{row.get('arrival_intensity')}-{row.get('carryover_ratio')}-seed{row.get('seed')}-inst{row.get('instance_id')}"
+
+
+def size_of(row: dict) -> str:
+    return row.get("size") or "unknown"
 
 
 def method_summary(detail: Sequence[dict]) -> List[dict]:
     groups: Dict[tuple, List[dict]] = {}
     for row in detail:
-        key = (row["arrival_intensity"], row["carryover_ratio"], row["reward_beta"], row["method"])
+        key = (size_of(row), row["arrival_intensity"], row["carryover_ratio"], row["reward_beta"], row["method"])
         groups.setdefault(key, []).append(row)
     out = []
-    for (arrival, carryover, beta, method), rows in sorted(groups.items()):
+    for (size, arrival, carryover, beta, method), rows in sorted(groups.items()):
         cmax = [fnum(r["Cmax"]) for r in rows]
         out.append(
             {
+                "size": size,
                 "arrival_intensity": arrival,
                 "carryover_ratio": carryover,
                 "reward_beta": beta,
@@ -107,19 +114,24 @@ def by_case(detail: Sequence[dict]) -> Dict[str, Dict[str, dict]]:
 
 def case_curve(detail: Sequence[dict]) -> List[dict]:
     rows = []
+    case_labels = {cid: f"C{idx + 1}" for idx, cid in enumerate(sorted(by_case(detail)))}
     for cid, methods in by_case(detail).items():
         if not methods:
             continue
         best = min(fnum(r["Cmax"]) for r in methods.values())
         fifo = fnum(methods.get("FIFO", {}).get("Cmax"))
         mlp = fnum(methods.get("MLP-Ranker", {}).get("Cmax"))
+        greedy = fnum(methods.get("GreedyECT", {}).get("Cmax"))
+        lookahead = fnum(methods.get("Lookahead", {}).get("Cmax"))
         ranked = sorted(methods.items(), key=lambda item: fnum(item[1]["Cmax"]))
         rank = {m: idx + 1 for idx, (m, _) in enumerate(ranked)}
         for method, row in methods.items():
             cmax = fnum(row["Cmax"])
             rows.append(
                 {
+                    "case_label": row.get("case_label") or case_labels[cid],
                     "case_id": cid,
+                    "size": size_of(row),
                     "arrival_intensity": row["arrival_intensity"],
                     "carryover_ratio": row["carryover_ratio"],
                     "reward_beta": row.get("reward_beta", ""),
@@ -130,6 +142,8 @@ def case_curve(detail: Sequence[dict]) -> List[dict]:
                     "Cmax_best_among_selected_methods": best,
                     "improvement_vs_FIFO": (fifo - cmax) / max(fifo, 1e-8) * 100.0 if fifo else 0.0,
                     "improvement_vs_MLPRanker": (mlp - cmax) / max(mlp, 1e-8) * 100.0 if mlp else 0.0,
+                    "improvement_vs_GreedyECT": (greedy - cmax) / max(greedy, 1e-8) * 100.0 if greedy else 0.0,
+                    "improvement_vs_Lookahead": (lookahead - cmax) / max(lookahead, 1e-8) * 100.0 if lookahead else 0.0,
                     "rank_among_selected_methods": rank[method],
                 }
             )
@@ -139,14 +153,15 @@ def case_curve(detail: Sequence[dict]) -> List[dict]:
 def arpd_summary(case_rows: Sequence[dict]) -> List[dict]:
     groups: Dict[tuple, List[dict]] = {}
     for row in case_rows:
-        key = (row["method"], row["arrival_intensity"], row["carryover_ratio"], row.get("reward_beta", ""))
+        key = (row["size"], row["method"], row["arrival_intensity"], row["carryover_ratio"], row.get("reward_beta", ""))
         groups.setdefault(key, []).append(row)
     out = []
-    for (method, arrival, carryover, beta), rows in sorted(groups.items()):
+    for (size, method, arrival, carryover, beta), rows in sorted(groups.items()):
         arpd = [(fnum(r["Cmax"]) - fnum(r["Cmax_best_among_selected_methods"])) / max(fnum(r["Cmax_best_among_selected_methods"]), 1e-8) * 100.0 for r in rows]
         ranks = [fnum(r["rank_among_selected_methods"]) for r in rows]
         out.append(
             {
+                "size": size,
                 "method": method,
                 "arrival_intensity": arrival,
                 "carryover_ratio": carryover,
@@ -159,6 +174,50 @@ def arpd_summary(case_rows: Sequence[dict]) -> List[dict]:
             }
         )
     return out
+
+
+def scale_summary(case_rows: Sequence[dict]) -> List[dict]:
+    groups: Dict[tuple, List[dict]] = {}
+    for row in case_rows:
+        groups.setdefault((row["size"], row["method"]), []).append(row)
+        groups.setdefault(("all", row["method"]), []).append(row)
+    out = []
+    for (size, method), rows in sorted(groups.items()):
+        cmax = [fnum(r["Cmax"]) for r in rows]
+        arpd = [(fnum(r["Cmax"]) - fnum(r["Cmax_best_among_selected_methods"])) / max(fnum(r["Cmax_best_among_selected_methods"]), 1e-8) * 100.0 for r in rows]
+        ranks = [fnum(r["rank_among_selected_methods"]) for r in rows]
+        out.append(
+            {
+                "size": size,
+                "method": method,
+                "Cmax_mean": mean(cmax),
+                "Cmax_std": pstdev(cmax) if len(cmax) > 1 else 0.0,
+                "ARPD_mean": mean(arpd),
+                "ARPD_std": pstdev(arpd) if len(arpd) > 1 else 0.0,
+                "rank_mean": mean(ranks),
+                "rank_std": pstdev(ranks) if len(ranks) > 1 else 0.0,
+                "n_instances": len(rows),
+            }
+        )
+    return out
+
+
+def case_mapping(case_rows: Sequence[dict]) -> List[dict]:
+    seen = {}
+    for row in case_rows:
+        seen.setdefault(
+            row["case_label"],
+            {
+                "case_label": row["case_label"],
+                "case_id": row["case_id"],
+                "size": row["size"],
+                "arrival_intensity": row["arrival_intensity"],
+                "carryover_ratio": row["carryover_ratio"],
+                "seed": row["seed"],
+                "instance_id": row["instance_id"],
+            },
+        )
+    return [seen[label] for label in sorted(seen, key=lambda x: int(str(x).lstrip("C") or 0))]
 
 
 def p_value_paired(diffs: List[float]) -> tuple[str, float | str]:
@@ -219,14 +278,18 @@ def run(args):
     cases = case_curve(detail)
     summary = method_summary(detail)
     arpd = arpd_summary(cases)
+    scale = scale_summary(cases)
+    mapping = case_mapping(cases)
     sig = significance(detail)
     if args.no_write:
-        print(f"No-write enabled: prepared {len(summary)} summary rows, {len(cases)} case rows.")
+        print(f"No-write enabled: prepared {len(summary)} summary rows, {len(cases)} case rows, {len(scale)} scale rows.")
         return out_paths
-    write_csv(out_paths["summary"], summary, ["arrival_intensity", "carryover_ratio", "reward_beta", "method", "Cmax_mean", "Cmax_std", "average_completion_time_mean", "average_waiting_time_mean", "machine_utilization_mean", "load_balance_std_mean", "runtime_seconds_mean", "valid_schedule_rate", "n_instances"])
-    write_csv(out_paths["arpd"], arpd, ["method", "arrival_intensity", "carryover_ratio", "reward_beta", "ARPD_mean", "ARPD_std", "rank_mean", "rank_std", "n_instances"])
+    write_csv(out_paths["summary"], summary, ["size", "arrival_intensity", "carryover_ratio", "reward_beta", "method", "Cmax_mean", "Cmax_std", "average_completion_time_mean", "average_waiting_time_mean", "machine_utilization_mean", "load_balance_std_mean", "runtime_seconds_mean", "valid_schedule_rate", "n_instances"])
+    write_csv(out_paths["arpd"], arpd, ["size", "method", "arrival_intensity", "carryover_ratio", "reward_beta", "ARPD_mean", "ARPD_std", "rank_mean", "rank_std", "n_instances"])
     write_csv(out_paths["sig"], sig, ["comparison", "baseline_method", "test_name", "n_pairs", "mean_diff", "median_diff", "p_value", "significant", "effect_direction"])
-    write_csv(out_paths["case"], cases, ["case_id", "arrival_intensity", "carryover_ratio", "reward_beta", "seed", "instance_id", "method", "Cmax", "Cmax_best_among_selected_methods", "improvement_vs_FIFO", "improvement_vs_MLPRanker", "rank_among_selected_methods"])
+    write_csv(out_paths["case"], cases, ["case_label", "case_id", "size", "arrival_intensity", "carryover_ratio", "reward_beta", "seed", "instance_id", "method", "Cmax", "Cmax_best_among_selected_methods", "improvement_vs_FIFO", "improvement_vs_MLPRanker", "improvement_vs_GreedyECT", "improvement_vs_Lookahead", "rank_among_selected_methods"])
+    write_csv(out_paths["scale"], scale, ["size", "method", "Cmax_mean", "Cmax_std", "ARPD_mean", "ARPD_std", "rank_mean", "rank_std", "n_instances"])
+    write_csv(out_paths["case_mapping"], mapping, ["case_label", "case_id", "size", "arrival_intensity", "carryover_ratio", "seed", "instance_id"])
     print(f"Saved v2 paper results to {args.output_dir}")
     return out_paths
 
