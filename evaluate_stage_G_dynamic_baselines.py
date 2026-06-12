@@ -34,7 +34,7 @@ from src.evaluation.metrics import compute_metrics
 
 RUNS_DIR = Path("data/results/stage_G/hgcr_dynamic_ppo/runs")
 OUTPUT_DIR = Path("data/results/stage_G/paper_results")
-DEFAULT_METHODS = ["Random", "SPT", "LPT", "FIFO", "GreedyECT", "Lookahead", "MinLoad", "MLP-Ranker", "HGCR-PPO"]
+DEFAULT_METHODS = ["Random", "SPT", "LPT", "GreedyECT", "Lookahead", "MinLoad", "MLP-Ranker", "HGCR-PPO"]
 DETAIL_FIELDS = [
     "scenario_run_id",
     "size",

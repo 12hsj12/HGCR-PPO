@@ -88,7 +88,12 @@ ACTION_FIELDS = ["rule_name", "selection_count", "selection_ratio"]
 CURVE_FIELDS = ["episode", "episode_reward", "episode_Cmax", "step_reward_sum", "final_reward", "total_reward"]
 ACTION_HISTORY_FIELDS = ["episode", "decision_index", "size", "seed", "arrival_intensity", "carryover_ratio", "reward_beta", "action_id", "action_name", "is_eval"]
 ACTION_STAGE_FIELDS = ["stage_start_episode", "stage_end_episode", "size", "seed", "arrival_intensity", "carryover_ratio", "reward_beta", "action_name", "action_count", "action_ratio"]
-ACTION_DISPLAY_NAMES = {"MLP_Ranker_soft_ce": "MLP-Ranker"}
+ACTION_DISPLAY_NAMES = {
+    "FIFO": "Arrival-order rule",
+    "MLP_Ranker_soft_ce": "MLP-Ranker",
+}
+EVAL_METHOD_DISPLAY_NAMES = {"MLP_Ranker_soft_ce": "MLP-Ranker"}
+ACTION_STAGE_NAMES = ["Arrival-order rule", "GreedyECT", "Lookahead", "MLP-Ranker"]
 
 
 @dataclass
@@ -409,7 +414,7 @@ def evaluate_all(model, scenarios, args, ranker_model, device) -> List[dict]:
     rows = []
     for method in methods:
         row = {
-            "method": ACTION_DISPLAY_NAMES.get(method, method),
+            "method": EVAL_METHOD_DISPLAY_NAMES.get(method, method),
             "scenario_type": "dynamic",
             "size": args.size,
             "arrival_intensity": args.arrival_intensity,
@@ -436,7 +441,7 @@ def action_stage_rows(action_history_rows: List[dict], args) -> List[dict]:
         bucket = [row for row in action_history_rows if start <= int(row["episode"]) <= end and not row["is_eval"]]
         total = max(1, len(bucket))
         counts = Counter(row["action_name"] for row in bucket)
-        for name in ["FIFO", "GreedyECT", "Lookahead", "MLP-Ranker"]:
+        for name in ACTION_STAGE_NAMES:
             rows.append(
                 {
                     "stage_start_episode": start,
