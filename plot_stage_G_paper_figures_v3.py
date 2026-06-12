@@ -139,8 +139,8 @@ def read_manifest(run_dir: Path) -> dict:
         return {}
 
 
-def load_run_tables(runs_dir: Path) -> tuple[List[dict], List[dict]]:
-    selected: Dict[tuple, tuple[float, Path, dict]] = {}
+def load_run_tables(runs_dir: Path, min_required_episode: int) -> tuple[List[dict], List[dict]]:
+    selected: Dict[tuple, tuple[bool, float, Path, dict, List[dict], int, int]] = {}
     if not runs_dir.exists():
         return [], []
     for run_dir in runs_dir.iterdir():
@@ -148,8 +148,16 @@ def load_run_tables(runs_dir: Path) -> tuple[List[dict], List[dict]]:
             continue
         manifest = read_manifest(run_dir)
         size = manifest.get("size")
-        if size not in SIZES or manifest.get("failed") is True:
+        if size not in SIZES:
             continue
+        eval_path = next(iter(sorted(run_dir.glob("eval_history*.csv"))), None)
+        eval_values = [row for row in read_csv(eval_path) if row.get("episode") not in {None, ""}]
+        max_eval_episode = max((int(fnum(row.get("episode"))) for row in eval_values), default=0)
+        configured_episodes = int(fnum(manifest.get("episodes") or (manifest.get("args") or {}).get("episodes"), min_required_episode))
+        required_episode = max(int(min_required_episode), configured_episodes)
+        disable_early_stop = manifest.get("disable_early_stop", (manifest.get("args") or {}).get("disable_early_stop"))
+        disable_ok = disable_early_stop is True if disable_early_stop is not None else not bool(manifest.get("early_stopped", False))
+        complete = bool(eval_values) and manifest.get("failed") is not True and disable_ok and max_eval_episode >= required_episode
         key = (
             size,
             manifest.get("arrival_intensity"),
@@ -158,17 +166,20 @@ def load_run_tables(runs_dir: Path) -> tuple[List[dict], List[dict]]:
             str(manifest.get("seed")),
         )
         stamp = run_dir.stat().st_mtime
-        if key not in selected or stamp > selected[key][0]:
-            selected[key] = (stamp, run_dir, manifest)
+        candidate = (complete, stamp, run_dir, manifest, eval_values, max_eval_episode, required_episode)
+        if key not in selected or (complete, stamp) > (selected[key][0], selected[key][1]):
+            selected[key] = candidate
 
     eval_rows: List[dict] = []
     action_rows: List[dict] = []
-    for _, run_dir, manifest in selected.values():
-        eval_path = next(iter(sorted(run_dir.glob("eval_history*.csv"))), None)
+    for complete, _, run_dir, manifest, eval_values, max_eval_episode, required_episode in selected.values():
         action_path = next(iter(sorted(run_dir.glob("action_stage_summary*.csv"))), None)
-        for row in read_csv(eval_path):
+        for row in eval_values:
             row["size"] = row.get("size") or manifest.get("size")
             row["run_id"] = manifest.get("run_id", run_dir.name)
+            row["run_complete"] = complete
+            row["run_max_episode"] = max_eval_episode
+            row["run_required_episode"] = required_episode
             eval_rows.append(row)
         for row in read_csv(action_path):
             row["size"] = row.get("size") or manifest.get("size")
@@ -198,7 +209,7 @@ def discover(args) -> Dict[str, object]:
         data[name] = clean_significance(rows) if name == "significance" else clean_external(rows)
     data["audit"] = read_csv(files["audit"])
     data["mapping"] = read_csv(files["mapping"])
-    eval_rows, action_rows = load_run_tables(Path(args.runs_dir))
+    eval_rows, action_rows = load_run_tables(Path(args.runs_dir), args.min_required_episode)
     data["eval_history"] = eval_rows
     data["action_stage"] = action_rows
     data["files"] = files
@@ -221,57 +232,105 @@ def filter_history(rows: Sequence[dict], *, size=None, beta=None, seed=None) -> 
     return sorted(out, key=lambda row: fnum(row.get("episode")))
 
 
-def plot_training_metric(data, out_dir, no_write, window, show_raw, metric, stem, ylabel, baseline=False):
+def convergence_seed_rows(rows: Sequence[dict], size: str, seed: int) -> List[dict]:
+    values = filter_history(rows, size=size, beta=5.0, seed=seed)
+    return sorted(values, key=lambda row: int(fnum(row.get("episode"))))
+
+
+def audit_convergence_size(rows: Sequence[dict], size: str, min_required_episode: int) -> Dict[int, dict]:
+    print(f"Convergence audit for size={size}:")
+    audit = {}
+    for seed in [0, 1, 2]:
+        values = convergence_seed_rows(rows, size, seed)
+        max_episode = max((int(fnum(row.get("episode"))) for row in values), default=0)
+        complete = bool(values) and all(bool(row.get("run_complete")) for row in values) and max_episode >= min_required_episode
+        audit[seed] = {"rows": values, "max_episode": max_episode, "complete": complete}
+        print(f"seed={seed} max_episode={max_episode} rows={len(values)} complete={complete}")
+        if not complete:
+            print(f"Warning: size={size} seed={seed} is incomplete and will be excluded from the mean curve by default.")
+    return audit
+
+
+def outer_episode_mean(seed_groups: Sequence[List[dict]], metric: str) -> tuple[List[int], List[float]]:
+    values_by_episode: Dict[int, List[float]] = {}
+    for rows in seed_groups:
+        for row in rows:
+            episode = int(fnum(row.get("episode")))
+            if episode <= 0 or row.get(metric) in {None, ""}:
+                continue
+            values_by_episode.setdefault(episode, []).append(fnum(row.get(metric)))
+    episodes = sorted(values_by_episode)
+    return episodes, [mean(values_by_episode[episode]) for episode in episodes]
+
+
+def plot_training_metric_by_size(data, out_dir, no_write, args, metric, stem_prefix, ylabel, baseline=False):
     rows = data["eval_history"]
     plt = mpl()
-    import numpy as np
+    for size in args.convergence_sizes:
+        if size not in SIZES:
+            print(f"Warning: unsupported convergence size={size}; skipped.")
+            continue
+        audit = audit_convergence_size(rows, size, args.min_required_episode)
+        complete_groups = [entry["rows"] for entry in audit.values() if entry["complete"]]
+        available_groups = [entry["rows"] for entry in audit.values() if entry["rows"]]
+        exclude_incomplete = args.require_complete_convergence_runs or args.exclude_incomplete_from_mean
+        mean_groups = complete_groups if exclude_incomplete else available_groups
+        if len(complete_groups) < 3:
+            print(f"Warning: size={size} has only {len(complete_groups)} complete seeds for the mean curve.")
+        if not mean_groups:
+            warn(stem_prefix, f"size={size} has no eligible seed data for mean aggregation")
+            continue
 
-    fig, axes = plt.subplots(1, 3, figsize=(11.2, 3.2), sharey=False)
-    any_data = False
-    for panel, (ax, size) in enumerate(zip(axes, SIZES)):
-        curves = []
-        x_values = []
-        missing = []
-        for seed in [0, 1, 2]:
-            values = filter_history(rows, size=size, beta=5.0, seed=seed)
-            if not values:
-                missing.append(seed)
-                continue
-            any_data = True
-            x = [fnum(row["episode"]) for row in values]
-            y = [fnum(row[metric]) for row in values]
-            x_values.append(x)
-            curves.append(y)
-            if show_raw:
-                ax.plot(x, y, linewidth=0.8, alpha=0.22, color=COLORS["HGCR-PPO"])
-        if missing:
-            print(f"Missing {stem} data: size={size}, seeds={missing}")
-        if curves:
-            length = min(len(curve) for curve in curves)
-            averaged = [mean(curve[idx] for curve in curves) for idx in range(length)]
-            ax.plot(x_values[0][:length], moving_average(averaged, window), linewidth=1.9, color=COLORS["HGCR-PPO"], label="HGCR-PPO mean")
-            if baseline:
-                base_rows = filter_history(rows, size=size, beta=5.0)
-                mlp = [fnum(row.get("baseline_MLPRanker_Cmax")) for row in base_rows if row.get("baseline_MLPRanker_Cmax") not in {None, ""}]
-                if mlp:
-                    ax.axhline(mean(mlp), linestyle="--", linewidth=1.1, color=COLORS["MLP-Ranker"], label="MLP-Ranker baseline")
-        ax.set_title(f"({chr(97 + panel)}) {size}")
+        fig, ax = plt.subplots(figsize=(6.8, 3.8))
+        if args.show_raw_curves:
+            for seed, entry in audit.items():
+                if not entry["rows"]:
+                    continue
+                if not entry["complete"] and not args.allow_incomplete_raw_curves:
+                    continue
+                x = [int(fnum(row.get("episode"))) for row in entry["rows"]]
+                y = [fnum(row.get(metric)) for row in entry["rows"]]
+                ax.plot(
+                    x,
+                    y,
+                    linewidth=0.8,
+                    alpha=0.25 if entry["complete"] else 0.18,
+                    linestyle="-" if entry["complete"] else "--",
+                    label=f"seed{seed} raw" + ("" if entry["complete"] else " (incomplete)"),
+                )
+
+        mean_episodes, mean_values = outer_episode_mean(mean_groups, metric)
+        smoothed = moving_average(mean_values, args.smoothing_window)
+        if mean_episodes:
+            ax.plot(mean_episodes, smoothed, linewidth=2.1, color="#111111", label="Mean smoothed")
+        mean_max = max(mean_episodes, default=0)
+        print(f"mean_curve_max_episode={mean_max}")
+        if mean_max < args.min_required_episode:
+            max_by_seed = {seed: entry["max_episode"] for seed, entry in audit.items()}
+            print(
+                f"Warning: size={size} mean curve stops at episode {mean_max}, below required {args.min_required_episode}; "
+                f"seed max episodes={max_by_seed}, eligible complete seeds={len(complete_groups)}."
+            )
+
+        if baseline:
+            baseline_rows = [row for group in mean_groups for row in group]
+            mlp = [fnum(row.get("baseline_MLPRanker_Cmax")) for row in baseline_rows if row.get("baseline_MLPRanker_Cmax") not in {None, ""}]
+            if mlp:
+                ax.axhline(mean(mlp), linestyle="--", linewidth=1.0, alpha=0.65, color=COLORS["MLP-Ranker"], label="MLP-Ranker baseline")
         ax.set_xlabel("Episode")
         ax.set_ylabel(ylabel)
         ax.grid(axis="y", alpha=0.25)
-    if not any_data:
+        ax.legend(frameon=False, fontsize=7, ncol=2)
+        fig.tight_layout()
+        save(fig, out_dir, f"{stem_prefix}_{size}_no_fifo", no_write)
         plt.close(fig)
-        warn(stem, "no valid small/medium/large training history")
-        return
-    axes[0].legend(frameon=False, fontsize=7)
-    fig.tight_layout()
-    save(fig, out_dir, stem, no_write)
-    plt.close(fig)
 
 
-def plot_fig2(data, out_dir, no_write, window, show_raw):
-    plot_training_metric(data, out_dir, no_write, window, show_raw, "eval_Cmax_mean", "Fig_2_training_convergence_no_fifo", "Eval Cmax mean", baseline=True)
-    plot_training_metric(data, out_dir, no_write, window, show_raw, "eval_reward_mean", "Fig_2b_training_reward_convergence_no_fifo", "Eval reward mean")
+def plot_fig2(data, out_dir, no_write, args):
+    if not args.split_convergence_by_size:
+        print("Warning: combined convergence figures are disabled; producing separate size files.")
+    plot_training_metric_by_size(data, out_dir, no_write, args, "eval_Cmax_mean", "Fig_2_training_convergence", "Evaluation Cmax", baseline=True)
+    plot_training_metric_by_size(data, out_dir, no_write, args, "eval_reward_mean", "Fig_2b_training_reward_convergence", "Evaluation reward")
 
 
 def plot_fig3(data, out_dir, no_write, window, show_raw):
@@ -682,7 +741,7 @@ def run(args):
     no_write = args.no_write or args.dry_run
     if not no_write:
         out_dir.mkdir(parents=True, exist_ok=True)
-    plot_fig2(data, out_dir, no_write, args.smoothing_window, args.show_raw_curves)
+    plot_fig2(data, out_dir, no_write, args)
     plot_fig3(data, out_dir, no_write, args.smoothing_window, args.show_raw_curves)
     plot_fig4(data, out_dir, no_write)
     plot_fig5(data, out_dir, no_write, args.max_case_labels)
@@ -702,6 +761,12 @@ def main() -> None:
     parser.add_argument("--output_dir", default=str(OUTPUT_DIR))
     parser.add_argument("--smoothing_window", type=int, default=3)
     parser.add_argument("--show_raw_curves", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--split_convergence_by_size", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--convergence_sizes", nargs="+", default=SIZES)
+    parser.add_argument("--require_complete_convergence_runs", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--min_required_episode", type=int, default=5000)
+    parser.add_argument("--allow_incomplete_raw_curves", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--exclude_incomplete_from_mean", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max_case_labels", type=int, default=60)
     parser.add_argument("--tie_threshold", type=float, default=0.001)
     parser.add_argument("--dry_run", action="store_true")
