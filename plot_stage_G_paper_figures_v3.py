@@ -112,6 +112,14 @@ def warn(name: str, message: str) -> None:
     print(f"Warning: {name}: {message}")
 
 
+def validated_methods(methods: Sequence[str], *, include_hgcr: bool = False) -> List[str]:
+    allowed = set(METHODS if include_hgcr else BASELINES)
+    invalid = [method for method in methods if method not in allowed]
+    if invalid:
+        raise ValueError(f"Unsupported or excluded external methods: {invalid}. Allowed: {sorted(allowed)}")
+    return list(dict.fromkeys(methods))
+
+
 def clean_external(rows: Sequence[dict]) -> List[dict]:
     dropped_fifo = sum(1 for row in rows if row.get("method") == "FIFO")
     dropped_unknown = sum(1 for row in rows if row.get("size") not in {*SIZES, "all"})
@@ -438,7 +446,7 @@ def sampled_case_labels(rows: Sequence[dict], limit: int) -> List[str]:
     return selected[:limit]
 
 
-def plot_fig5(data, out_dir, no_write, max_cases):
+def plot_fig5(data, out_dir, no_write, max_cases, compare_baselines):
     rows = data["case"]
     if not rows:
         warn("Fig_5", "missing v3 case detail")
@@ -452,7 +460,8 @@ def plot_fig5(data, out_dir, no_write, max_cases):
     plt = mpl()
     fig, axes = plt.subplots(2, 1, figsize=(max(9.0, len(labels) * 0.16), 5.5), sharex=True)
     x = list(range(len(labels)))
-    for method in METHODS:
+    displayed_methods = ["HGCR-PPO", *compare_baselines]
+    for method in displayed_methods:
         y = []
         for label in labels:
             hit = next((row for row in rows if row.get("case_label") == label and row.get("method") == method), None)
@@ -464,7 +473,8 @@ def plot_fig5(data, out_dir, no_write, max_cases):
         "Lookahead": "improvement_vs_Lookahead",
         "MinLoad": "improvement_vs_MinLoad",
     }
-    for baseline, field in fields.items():
+    for baseline in compare_baselines:
+        field = fields[baseline]
         y = []
         for label in labels:
             hit = next((row for row in rows if row.get("case_label") == label and row.get("method") == "HGCR-PPO"), None)
@@ -490,7 +500,7 @@ def plot_fig5(data, out_dir, no_write, max_cases):
     step = max(1, len(labels) // 12)
     axes[1].set_xticks(x[::step])
     axes[1].set_xticklabels(labels[::step])
-    axes[0].legend(frameon=False, ncol=5, fontsize=7)
+    axes[0].legend(frameon=False, ncol=max(1, len(displayed_methods)), fontsize=7)
     axes[1].legend(frameon=False, ncol=2, fontsize=7)
     for ax in axes:
         ax.grid(axis="y", alpha=0.25)
@@ -533,9 +543,9 @@ def plot_distribution(data, out_dir, no_write, methods, stem, zoom=False):
     plt.close(fig)
 
 
-def plot_fig6(data, out_dir, no_write):
+def plot_fig6(data, out_dir, no_write, top_methods_zoom):
     plot_distribution(data, out_dir, no_write, METHODS, "Fig_6a_distribution_all_methods_no_fifo")
-    plot_distribution(data, out_dir, no_write, ["HGCR-PPO", "MinLoad", "GreedyECT", "Lookahead"], "Fig_6b_distribution_top_methods_zoom_no_fifo", zoom=True)
+    plot_distribution(data, out_dir, no_write, top_methods_zoom, "Fig_6b_distribution_top_methods_zoom_no_fifo", zoom=True)
 
 
 def plot_fig8(data, out_dir, no_write):
@@ -566,7 +576,7 @@ def plot_fig8(data, out_dir, no_write):
     plt.close(fig)
 
 
-def plot_a1(data, out_dir, no_write):
+def plot_a1(data, out_dir, no_write, compare_baselines):
     rows = data["summary"]
     if not rows:
         warn("Fig_A1", "missing v3 summary")
@@ -574,10 +584,11 @@ def plot_a1(data, out_dir, no_write):
     import numpy as np
 
     plt = mpl()
-    fig, axes = plt.subplots(1, 4, figsize=(12.8, 3.1), sharey=True)
+    fig, axes = plt.subplots(1, len(compare_baselines), figsize=(3.2 * len(compare_baselines), 3.1), sharey=True)
+    axes = np.atleast_1d(axes).ravel().tolist()
     any_missing = False
     image = None
-    for ax, baseline in zip(axes, BASELINES):
+    for ax, baseline in zip(axes, compare_baselines):
         matrix = np.full((3, 3), np.nan)
         missing = []
         for i, arrival in enumerate(ARRIVALS):
@@ -603,13 +614,13 @@ def plot_a1(data, out_dir, no_write):
                     ax.text(j, i, f"{matrix[i, j]:.1f}%", ha="center", va="center", fontsize=8)
     axes[0].set_ylabel("Arrival")
     if image is not None:
-        fig.colorbar(image, ax=axes.ravel().tolist(), label="Improvement (%)")
+        fig.colorbar(image, ax=axes, label="Improvement (%)")
     stem = "Fig_A1_dynamic_heatmap_3x3_no_fifo_partial" if any_missing else "Fig_A1_dynamic_heatmap_3x3_no_fifo"
     save(fig, out_dir, stem, no_write)
     plt.close(fig)
 
 
-def plot_a2(data, out_dir, no_write):
+def plot_a2(data, out_dir, no_write, compare_baselines):
     summary = [row for row in data["summary"] if row.get("size") == "small" and row.get("arrival_intensity") == "medium" and row.get("carryover_ratio") == "medium"]
     hgcr = [row for row in summary if row.get("method") == "HGCR-PPO"]
     available = {round(fnum(row.get("reward_beta")), 6) for row in hgcr}
@@ -629,7 +640,7 @@ def plot_a2(data, out_dir, no_write):
     axes[0].plot(x, cmax, marker="o", color=COLORS["HGCR-PPO"])
     axes[0].set_title("(a) beta -> final Cmax")
     axes[0].set_ylabel("Cmax mean")
-    for baseline in BASELINES:
+    for baseline in compare_baselines:
         values = []
         for beta, hgcr_value in zip(BETAS, cmax):
             base = next((row for row in summary if row.get("method") == baseline and round(fnum(row.get("reward_beta")), 6) == round(beta, 6)), None)
@@ -728,6 +739,8 @@ def plot_a4(data, out_dir, no_write):
 
 
 def run(args):
+    compare_baselines = validated_methods(args.main_compare_baselines)
+    top_methods_zoom = validated_methods(args.top_methods_zoom, include_hgcr=True)
     data = discover(args)
     out_dir = Path(args.output_dir) / token()
     print(f"Planned figure dir: {out_dir}")
@@ -744,11 +757,11 @@ def run(args):
     plot_fig2(data, out_dir, no_write, args)
     plot_fig3(data, out_dir, no_write, args.smoothing_window, args.show_raw_curves)
     plot_fig4(data, out_dir, no_write)
-    plot_fig5(data, out_dir, no_write, args.max_case_labels)
-    plot_fig6(data, out_dir, no_write)
+    plot_fig5(data, out_dir, no_write, args.max_case_labels, compare_baselines)
+    plot_fig6(data, out_dir, no_write, top_methods_zoom)
     plot_fig8(data, out_dir, no_write)
-    plot_a1(data, out_dir, no_write)
-    plot_a2(data, out_dir, no_write)
+    plot_a1(data, out_dir, no_write, compare_baselines)
+    plot_a2(data, out_dir, no_write, compare_baselines)
     plot_a3(data, out_dir, no_write, args.tie_threshold)
     plot_a4(data, out_dir, no_write)
     return out_dir
@@ -767,6 +780,8 @@ def main() -> None:
     parser.add_argument("--min_required_episode", type=int, default=5000)
     parser.add_argument("--allow_incomplete_raw_curves", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--exclude_incomplete_from_mean", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--main_compare_baselines", nargs="+", default=BASELINES)
+    parser.add_argument("--top_methods_zoom", nargs="+", default=["HGCR-PPO", "MinLoad", "GreedyECT", "Lookahead"])
     parser.add_argument("--max_case_labels", type=int, default=60)
     parser.add_argument("--tie_threshold", type=float, default=0.001)
     parser.add_argument("--dry_run", action="store_true")
