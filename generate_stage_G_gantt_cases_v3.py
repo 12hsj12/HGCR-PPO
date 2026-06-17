@@ -164,7 +164,7 @@ def render(case: dict, trace: List[dict], out_dir: Path) -> None:
     for ax, method in zip(axes, [reference, "HGCR-PPO"]):
         draw_method(ax, trace_rows(trace, case, method), case["methods"][method], method)
     ref_row = case["methods"][reference]
-    fig.suptitle(f"Representative case: {ref_row.get('size', '')} scale, {ref_row.get('arrival_intensity', '')} arrival", y=1.01)
+    fig.suptitle("Representative scheduling case", y=1.01)
     fig.tight_layout()
     save(fig, out_dir, f"gantt_case1_comparison_{reference_stem}_vs_HGCR")
     plt.close(fig)
@@ -234,7 +234,7 @@ def main() -> None:
     parser.add_argument("--detail_file")
     parser.add_argument("--trace_file")
     parser.add_argument("--primary_baseline", default="MLP-Ranker", choices=SUPPORTED_BASELINES)
-    parser.add_argument("--candidate_baselines", nargs="+", default=SUPPORTED_BASELINES)
+    parser.add_argument("--candidate_baselines", nargs="+", default=["MLP-Ranker"])
     parser.add_argument("--exclude_methods", nargs="+", default=["FIFO"])
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--no_write", action="store_true")

@@ -22,6 +22,8 @@ ARRIVALS = ["low", "medium", "high"]
 CARRYOVERS = ["low", "medium", "high"]
 BETAS = [0.01, 0.1, 1.0, 2.0, 5.0]
 METHODS = ["HGCR-PPO", "MLP-Ranker", "GreedyECT", "Lookahead", "MinLoad"]
+MAIN_METHOD_ORDER = ["HGCR-PPO", "MLP-Ranker", "GreedyECT", "Lookahead", "MinLoad"]
+DISTRIBUTION_METHOD_ORDER = ["HGCR-PPO", "MinLoad", "GreedyECT", "Lookahead", "MLP-Ranker"]
 BASELINES = ["MLP-Ranker", "GreedyECT", "Lookahead", "MinLoad"]
 ACTIONS = ["Arrival-order rule", "GreedyECT", "Lookahead", "MLP-Ranker"]
 ACTION_LABELS = {
@@ -33,17 +35,19 @@ ACTION_LABELS = {
     "MLP_Ranker_soft_ce": "MLP-Ranker rule",
 }
 COLORS = {
-    "HGCR-PPO": "#111111",
-    "MLP-Ranker": "#D04A3A",
-    "GreedyECT": "#2878B5",
-    "Lookahead": "#3B9B59",
-    "MinLoad": "#8A5AA5",
-    "Arrival-order rule": "#7A7A7A",
+    "HGCR-PPO": "#DB3124",
+    "MLP-Ranker": "#4B74B2",
+    "GreedyECT": "#FC8C5A",
+    "Lookahead": "#90BEE0",
+    "MinLoad": "#FFDF92",
+    "Arrival-order rule": "#DB3124",
+    "auxiliary": "#E6F1F3",
+    "mean": "#111111",
 }
 
 
 def token() -> str:
-    return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{uuid.uuid4().hex[:8]}_no_fifo_v3"
+    return f"{datetime.now().strftime('%Y%m%d-%H%M%S')}_{uuid.uuid4().hex[:8]}_no_fifo_v3_refined"
 
 
 def latest(root: Path, pattern: str) -> Path | None:
@@ -301,8 +305,9 @@ def plot_training_metric_by_size(data, out_dir, no_write, args, metric, stem_pre
                 ax.plot(
                     x,
                     y,
-                    linewidth=0.8,
-                    alpha=0.25 if entry["complete"] else 0.18,
+                    linewidth=0.65,
+                    alpha=0.18 if entry["complete"] else 0.11,
+                    color=COLORS["HGCR-PPO"],
                     linestyle="-" if entry["complete"] else "--",
                     label=f"seed{seed} raw" + ("" if entry["complete"] else " (incomplete)"),
                 )
@@ -310,7 +315,7 @@ def plot_training_metric_by_size(data, out_dir, no_write, args, metric, stem_pre
         mean_episodes, mean_values = outer_episode_mean(mean_groups, metric)
         smoothed = moving_average(mean_values, args.smoothing_window)
         if mean_episodes:
-            ax.plot(mean_episodes, smoothed, linewidth=2.1, color="#111111", label="Mean smoothed")
+            ax.plot(mean_episodes, smoothed, linewidth=2.6, color=COLORS["mean"], label="Mean smoothed", zorder=5)
         mean_max = max(mean_episodes, default=0)
         print(f"mean_curve_max_episode={mean_max}")
         if mean_max < args.min_required_episode:
@@ -324,11 +329,22 @@ def plot_training_metric_by_size(data, out_dir, no_write, args, metric, stem_pre
             baseline_rows = [row for group in mean_groups for row in group]
             mlp = [fnum(row.get("baseline_MLPRanker_Cmax")) for row in baseline_rows if row.get("baseline_MLPRanker_Cmax") not in {None, ""}]
             if mlp:
-                ax.axhline(mean(mlp), linestyle="--", linewidth=1.0, alpha=0.65, color=COLORS["MLP-Ranker"], label="MLP-Ranker baseline")
+                ax.axhline(mean(mlp), linestyle="--", linewidth=0.95, alpha=0.5, color=COLORS["MLP-Ranker"], label="MLP-Ranker baseline")
+        plotted_values = [fnum(row.get(metric)) for group in available_groups for row in group if row.get(metric) not in {None, ""}]
+        if metric == "eval_Cmax_mean" and plotted_values:
+            y_min, y_max = min(plotted_values), max(plotted_values)
+            margin = max(1.0, (y_max - y_min) * 0.12)
+            ax.set_ylim(y_min - margin, y_max + margin)
+        if metric == "eval_Cmax_mean" and mean_episodes:
+            start_mean = mean_values[0]
+            final_mean = mean_values[-1]
+            best_mean = min(mean_values)
+            ax.annotate(f"start {start_mean:.1f}", xy=(mean_episodes[0], smoothed[0]), xytext=(8, 10), textcoords="offset points", fontsize=7, color=COLORS["mean"])
+            ax.annotate(f"best {best_mean:.1f}\nfinal {final_mean:.1f}", xy=(mean_episodes[-1], smoothed[-1]), xytext=(-72, 16), textcoords="offset points", fontsize=7, color=COLORS["mean"])
         ax.set_xlabel("Episode")
         ax.set_ylabel(ylabel)
         ax.grid(axis="y", alpha=0.25)
-        ax.legend(frameon=False, fontsize=7, ncol=2)
+        ax.legend(frameon=False, fontsize=7, ncol=2, loc="best")
         fig.tight_layout()
         save(fig, out_dir, f"{stem_prefix}_{size}_no_fifo", no_write)
         plt.close(fig)
@@ -351,7 +367,7 @@ def plot_fig3(data, out_dir, no_write, window, show_raw):
         return
     plt = mpl()
     fig, axes = plt.subplots(1, 2, figsize=(8.4, 3.2))
-    palette = ["#7B3294", "#008837", "#A6611A", "#0571B0", "#CA0020"]
+    palette = [COLORS["HGCR-PPO"], COLORS["MLP-Ranker"], COLORS["GreedyECT"], COLORS["Lookahead"], COLORS["MinLoad"]]
     for beta, color in zip(BETAS, palette):
         values = filter_history(rows, size="small", beta=beta, seed=0)
         if not values:
@@ -360,8 +376,8 @@ def plot_fig3(data, out_dir, no_write, window, show_raw):
         for ax, metric in zip(axes, ["eval_Cmax_mean", "eval_reward_mean"]):
             y = [fnum(row[metric]) for row in values]
             if show_raw:
-                ax.plot(x, y, color=color, alpha=0.22, linewidth=0.8)
-            ax.plot(x, moving_average(y, window), color=color, linewidth=1.6, label=rf"$\beta$={beta:g}")
+                ax.plot(x, y, color=color, alpha=0.16, linewidth=0.65)
+            ax.plot(x, moving_average(y, window), color=color, linewidth=1.7, label=rf"$\beta$={beta:g}")
     axes[0].set_title("(a) Eval Cmax under different beta")
     axes[1].set_title("(b) Eval reward under different beta")
     axes[0].set_ylabel("Eval Cmax mean")
@@ -369,7 +385,7 @@ def plot_fig3(data, out_dir, no_write, window, show_raw):
     for ax in axes:
         ax.set_xlabel("Episode")
         ax.grid(axis="y", alpha=0.25)
-    axes[1].legend(frameon=False, fontsize=7)
+    axes[1].legend(frameon=False, fontsize=7, ncol=1, loc="best")
     fig.tight_layout()
     save(fig, out_dir, "Fig_3_beta_sensitivity_training_curves_no_fifo", no_write)
     plt.close(fig)
@@ -419,9 +435,10 @@ def plot_fig4(data, out_dir, no_write):
         ax.set_ylim(0, 1.02)
         ax.grid(axis="y", alpha=0.2)
     axes[0].set_ylabel("Action percentage")
-    fig.suptitle("HGCR-PPO action selection evolution", y=1.03)
-    axes[-1].legend(frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
-    fig.tight_layout()
+    fig.suptitle("HGCR-PPO action selection evolution", y=1.02)
+    handles, labels = axes[-1].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, ncol=4, loc="upper center", bbox_to_anchor=(0.5, 1.01))
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
     save(fig, out_dir, "Fig_4_action_ratio_evolution_no_fifo_label", no_write)
     plt.close(fig)
 
@@ -458,9 +475,9 @@ def plot_fig5(data, out_dir, no_write, max_cases, compare_baselines):
         mapping.append({key: row.get(key, "") for key in ["case_label", "case_id", "size", "arrival_intensity", "carryover_ratio", "seed", "instance_id"]})
     write_csv(out_dir / "Fig_5_case_mapping_no_fifo.csv", mapping, ["case_label", "case_id", "size", "arrival_intensity", "carryover_ratio", "seed", "instance_id"], no_write)
     plt = mpl()
-    fig, axes = plt.subplots(2, 1, figsize=(max(9.0, len(labels) * 0.16), 5.5), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(max(9.5, len(labels) * 0.17), 6.4), sharex=True)
     x = list(range(len(labels)))
-    displayed_methods = ["HGCR-PPO", *compare_baselines]
+    displayed_methods = [method for method in MAIN_METHOD_ORDER if method == "HGCR-PPO" or method in compare_baselines]
     for method in displayed_methods:
         y = []
         for label in labels:
@@ -491,8 +508,8 @@ def plot_fig5(data, out_dir, no_write, max_cases, compare_baselines):
     for size in SIZES:
         indexes = [idx for idx, row in enumerate(mapping) if row.get("size") == size]
         if indexes:
-            axes[0].axvspan(min(indexes) - 0.5, max(indexes) + 0.5, alpha=0.035, color=COLORS.get("MinLoad"))
-            axes[0].text(mean(indexes), axes[0].get_ylim()[1], size, ha="center", va="bottom", fontsize=8)
+            axes[0].axvspan(min(indexes) - 0.5, max(indexes) + 0.5, alpha=0.045, color=COLORS["auxiliary"])
+            axes[1].axvspan(min(indexes) - 0.5, max(indexes) + 0.5, alpha=0.035, color=COLORS["auxiliary"])
     axes[0].set_title("(a) Cmax across representative cases")
     axes[1].set_title("(b) Relative improvement of HGCR-PPO over baselines")
     axes[0].set_ylabel("Cmax")
@@ -500,11 +517,12 @@ def plot_fig5(data, out_dir, no_write, max_cases, compare_baselines):
     step = max(1, len(labels) // 12)
     axes[1].set_xticks(x[::step])
     axes[1].set_xticklabels(labels[::step])
-    axes[0].legend(frameon=False, ncol=max(1, len(displayed_methods)), fontsize=7)
-    axes[1].legend(frameon=False, ncol=2, fontsize=7)
+    handles0, labels0 = axes[0].get_legend_handles_labels()
+    handles1, labels1 = axes[1].get_legend_handles_labels()
+    fig.legend(handles0 + handles1, labels0 + labels1, frameon=False, ncol=3, loc="upper center", bbox_to_anchor=(0.5, 1.01), fontsize=7)
     for ax in axes:
         ax.grid(axis="y", alpha=0.25)
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.9], h_pad=2.0)
     save(fig, out_dir, "Fig_5_case_performance_curves_no_fifo", no_write)
     plt.close(fig)
 
@@ -544,8 +562,9 @@ def plot_distribution(data, out_dir, no_write, methods, stem, zoom=False):
 
 
 def plot_fig6(data, out_dir, no_write, top_methods_zoom):
-    plot_distribution(data, out_dir, no_write, METHODS, "Fig_6a_distribution_all_methods_no_fifo")
-    plot_distribution(data, out_dir, no_write, top_methods_zoom, "Fig_6b_distribution_top_methods_zoom_no_fifo", zoom=True)
+    plot_distribution(data, out_dir, no_write, DISTRIBUTION_METHOD_ORDER, "Fig_6a_distribution_all_methods_no_fifo")
+    if top_methods_zoom:
+        plot_distribution(data, out_dir, no_write, top_methods_zoom, "Fig_6b_distribution_top_methods_zoom_no_fifo", zoom=True)
 
 
 def plot_fig8(data, out_dir, no_write):
@@ -633,7 +652,7 @@ def plot_a2(data, out_dir, no_write, compare_baselines):
     import numpy as np
 
     plt = mpl()
-    fig, axes = plt.subplots(1, 3 if has_actions else 2, figsize=(10.8 if has_actions else 7.4, 3.2))
+    fig, axes = plt.subplots(1, 3 if has_actions else 2, figsize=(12.4 if has_actions else 7.6, 3.4))
     axes = np.ravel(axes).tolist()
     x = np.arange(len(BETAS))
     cmax = [fnum(next(row for row in hgcr if round(fnum(row.get("reward_beta")), 6) == round(beta, 6))["Cmax_mean"]) for beta in BETAS]
@@ -649,7 +668,7 @@ def plot_a2(data, out_dir, no_write, compare_baselines):
     axes[1].axhline(0, color="black", linewidth=0.7)
     axes[1].set_title("(b) improvement over baselines")
     axes[1].set_ylabel("Improvement (%)")
-    axes[1].legend(frameon=False, fontsize=7)
+    axes[1].legend(frameon=False, fontsize=7, loc="best")
     if has_actions:
         bottom = np.zeros(len(BETAS))
         for action in ACTIONS:
@@ -664,12 +683,13 @@ def plot_a2(data, out_dir, no_write, compare_baselines):
             bottom += np.asarray(values)
         axes[2].set_title("(c) final action ratio")
         axes[2].set_ylabel("Action ratio")
-        axes[2].legend(frameon=False, fontsize=7)
+        handles, labels = axes[2].get_legend_handles_labels()
+        axes[2].legend(handles, labels, frameon=False, fontsize=7, bbox_to_anchor=(1.02, 1), loc="upper left")
     for ax in axes:
         ax.set_xticks(x); ax.set_xticklabels([str(beta) for beta in BETAS], rotation=25)
         ax.set_xlabel("reward_beta")
         ax.grid(axis="y", alpha=0.25)
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 0.92 if has_actions else 1, 1], w_pad=2.0)
     save(fig, out_dir, "Fig_A2_beta_final_summary_no_fifo", no_write)
     plt.close(fig)
 
@@ -692,16 +712,16 @@ def plot_a3(data, out_dir, no_write, tie_threshold):
             counts["Tie" if abs(relative) <= tie_threshold else ("Win" if relative < 0 else "Loss")] += 1
         results.append((baseline, counts))
     plt = mpl()
-    fig, ax = plt.subplots(figsize=(7.2, 3.3))
+    fig, ax = plt.subplots(figsize=(7.6, 3.5))
     left = [0] * len(results)
-    for label, color in [("Win", "#4C9F70"), ("Tie", "#B8B8B8"), ("Loss", "#D7655B")]:
+    for label, color in [("Win", COLORS["HGCR-PPO"]), ("Tie", COLORS["auxiliary"]), ("Loss", COLORS["MLP-Ranker"])]:
         values = [counts[label] for _, counts in results]
         ax.barh([baseline for baseline, _ in results], values, left=left, label=label, color=color)
         left = [a + b for a, b in zip(left, values)]
     ax.set_xlabel("Number of cases")
-    ax.legend(frameon=False, ncol=3)
+    ax.legend(frameon=False, ncol=3, loc="upper center", bbox_to_anchor=(0.5, 1.16))
     ax.grid(axis="x", alpha=0.25)
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
     save(fig, out_dir, "Fig_A3_win_tie_loss_no_fifo", no_write)
     plt.close(fig)
 
@@ -713,9 +733,9 @@ def plot_a4(data, out_dir, no_write):
         warn("Fig_A4", "missing all-size v3 scale summary")
         return
     plt = mpl()
-    fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.2))
-    ordered = [next((row for row in scale if row.get("method") == method), None) for method in METHODS]
-    methods = [method for method, row in zip(METHODS, ordered) if row]
+    fig, axes = plt.subplots(1, 2, figsize=(8.2, 3.3))
+    ordered = [next((row for row in scale if row.get("method") == method), None) for method in MAIN_METHOD_ORDER]
+    methods = [method for method, row in zip(MAIN_METHOD_ORDER, ordered) if row]
     rows = [row for row in ordered if row]
     axes[0].bar(methods, [fnum(row["ARPD_mean"]) for row in rows], color=[COLORS[method] for method in methods])
     axes[1].bar(methods, [fnum(row["rank_mean"]) for row in rows], color=[COLORS[method] for method in methods])
@@ -726,15 +746,12 @@ def plot_a4(data, out_dir, no_write):
     for ax in axes[:2]:
         ax.tick_params(axis="x", rotation=25)
         ax.grid(axis="y", alpha=0.25)
-    axes[2].axis("off")
-    table_rows = []
-    for baseline in BASELINES:
-        row = next((item for item in sig if item.get("baseline_method") == baseline), None)
-        table_rows.append([baseline, row.get("n_pairs", "") if row else "", f"{fnum(row.get('p_value')):.3g}" if row and row.get("p_value") not in {"", None} else "NA"])
-    axes[2].set_title("(c) Significance")
-    axes[2].table(cellText=table_rows, colLabels=["Baseline", "n", "p-value"], loc="center", cellLoc="center")
-    fig.tight_layout()
-    save(fig, out_dir, "Fig_A4_arpd_rank_significance_no_fifo", no_write)
+    fig.tight_layout(w_pad=2.0)
+    save(fig, out_dir, "Fig_A4_arpd_rank_no_fifo", no_write)
+    source_rows = [{key: row.get(key, "") for key in ["size", "method", "Cmax_mean", "Cmax_std", "ARPD_mean", "ARPD_std", "rank_mean", "rank_std", "n_instances"]} for row in rows]
+    sig_rows = [{key: row.get(key, "") for key in ["comparison", "baseline_method", "test_name", "n_pairs", "mean_diff", "median_diff", "p_value", "significant", "effect_direction"]} for row in sig]
+    write_csv(out_dir / "Fig_A4_arpd_rank_source_no_fifo.csv", source_rows, ["size", "method", "Cmax_mean", "Cmax_std", "ARPD_mean", "ARPD_std", "rank_mean", "rank_std", "n_instances"], no_write)
+    write_csv(out_dir / "Fig_A4_significance_table_no_fifo.csv", sig_rows, ["comparison", "baseline_method", "test_name", "n_pairs", "mean_diff", "median_diff", "p_value", "significant", "effect_direction"], no_write)
     plt.close(fig)
 
 
@@ -758,7 +775,7 @@ def run(args):
     plot_fig3(data, out_dir, no_write, args.smoothing_window, args.show_raw_curves)
     plot_fig4(data, out_dir, no_write)
     plot_fig5(data, out_dir, no_write, args.max_case_labels, compare_baselines)
-    plot_fig6(data, out_dir, no_write, top_methods_zoom)
+    plot_fig6(data, out_dir, no_write, top_methods_zoom if args.generate_zoom_distribution else [])
     plot_fig8(data, out_dir, no_write)
     plot_a1(data, out_dir, no_write, compare_baselines)
     plot_a2(data, out_dir, no_write, compare_baselines)
@@ -775,13 +792,14 @@ def main() -> None:
     parser.add_argument("--smoothing_window", type=int, default=3)
     parser.add_argument("--show_raw_curves", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--split_convergence_by_size", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--convergence_sizes", nargs="+", default=SIZES)
+    parser.add_argument("--convergence_sizes", nargs="+", default=["small"])
     parser.add_argument("--require_complete_convergence_runs", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--min_required_episode", type=int, default=5000)
     parser.add_argument("--allow_incomplete_raw_curves", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--exclude_incomplete_from_mean", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--main_compare_baselines", nargs="+", default=BASELINES)
     parser.add_argument("--top_methods_zoom", nargs="+", default=["HGCR-PPO", "MinLoad", "GreedyECT", "Lookahead"])
+    parser.add_argument("--generate_zoom_distribution", action="store_true")
     parser.add_argument("--max_case_labels", type=int, default=60)
     parser.add_argument("--tie_threshold", type=float, default=0.001)
     parser.add_argument("--dry_run", action="store_true")
