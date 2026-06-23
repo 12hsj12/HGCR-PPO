@@ -40,7 +40,7 @@ from utils.experiment_io import progress_iter, write_csv
 
 
 RULE_NAMES = ["FIFO", "GreedyECT", "Lookahead", "MLP_Ranker_soft_ce"]
-REWARD_MODES = ["env_cmax_delta", "final_delta", "util_plus_cmax"]
+REWARD_MODES = ["env_cmax_delta", "final_delta", "util_only", "cmax_only", "util_plus_cmax"]
 TRAIN_FIELDS = [
     "episode",
     "episode_reward",
@@ -71,6 +71,21 @@ EVAL_HISTORY_FIELDS = [
     "baseline_FIFO_Cmax",
     "baseline_MLPRanker_Cmax",
 ]
+EVAL_HISTORY_FIELDS_NO_FIFO = [
+    "eval_step",
+    "episode",
+    "size",
+    "seed",
+    "arrival_intensity",
+    "carryover_ratio",
+    "reward_beta",
+    "eval_Cmax_mean",
+    "eval_Cmax_std",
+    "eval_reward_mean",
+    "eval_reward_std",
+    "best_so_far_Cmax",
+    "baseline_MLPRanker_Cmax",
+]
 EVAL_FIELDS = [
     "method",
     "scenario_type",
@@ -80,6 +95,18 @@ EVAL_FIELDS = [
     "Cmax_mean",
     "Cmax_std",
     "relative_to_FIFO",
+    "relative_to_MLPRanker",
+    "valid_schedule_rate",
+    "runtime_mean",
+]
+EVAL_FIELDS_NO_FIFO = [
+    "method",
+    "scenario_type",
+    "size",
+    "arrival_intensity",
+    "carryover_ratio",
+    "Cmax_mean",
+    "Cmax_std",
     "relative_to_MLPRanker",
     "valid_schedule_rate",
     "runtime_mean",
@@ -94,6 +121,24 @@ ACTION_DISPLAY_NAMES = {
 }
 EVAL_METHOD_DISPLAY_NAMES = {"MLP_Ranker_soft_ce": "MLP-Ranker"}
 ACTION_STAGE_NAMES = ["Arrival-order rule", "GreedyECT", "Lookahead", "MLP-Ranker"]
+ACTION_ALIASES = {
+    "fifo": "FIFO",
+    "arrival_order": "FIFO",
+    "arrival-order": "FIFO",
+    "arrival_order_rule": "FIFO",
+    "arrival-order-rule": "FIFO",
+    "arrival-order rule": "FIFO",
+    "Arrival-order rule": "FIFO",
+    "GreedyECT": "GreedyECT",
+    "greedyect": "GreedyECT",
+    "greedy_ect": "GreedyECT",
+    "Lookahead": "Lookahead",
+    "lookahead": "Lookahead",
+    "MLP-Ranker": "MLP_Ranker_soft_ce",
+    "mlp_ranker": "MLP_Ranker_soft_ce",
+    "mlp-ranker": "MLP_Ranker_soft_ce",
+    "MLP_Ranker_soft_ce": "MLP_Ranker_soft_ce",
+}
 
 
 @dataclass
@@ -152,18 +197,51 @@ class RuleActorCritic(nn.Module):
         self.actor = nn.Sequential(nn.Linear(state_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, action_dim))
         self.critic = nn.Sequential(nn.Linear(state_dim, hidden_dim), nn.Tanh(), nn.Linear(hidden_dim, 1))
 
-    def dist_value(self, states):
+    def dist_value(self, states, disabled_ids: Sequence[int] | None = None):
         logits = self.actor(states)
+        if disabled_ids:
+            logits = logits.clone()
+            logits[:, list(disabled_ids)] = -1.0e9
         value = self.critic(states).squeeze(-1)
         return torch.distributions.Categorical(logits=logits), value
 
 
 def make_run_id(args) -> str:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ablation = ""
+    if getattr(args, "ablation_family", "") and getattr(args, "ablation_name", ""):
+        safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in args.ablation_name)
+        ablation = f"_{args.ablation_family}_{safe_name}"
     return (
         f"HGCRDYN_stageG_{args.size}_k{args.top_k}_e{args.episodes}_s{args.seed}"
-        f"_{args.arrival_intensity}_{args.carryover_ratio}_b{args.reward_beta}_{stamp}_{uuid.uuid4().hex[:8]}"
+        f"_{args.arrival_intensity}_{args.carryover_ratio}_b{args.reward_beta}{ablation}_{stamp}_{uuid.uuid4().hex[:8]}"
     )
+
+
+def canonical_action_name(name: str) -> str:
+    key = str(name).strip()
+    canonical = ACTION_ALIASES.get(key) or ACTION_ALIASES.get(key.lower())
+    if canonical is None:
+        allowed = ", ".join(ACTION_STAGE_NAMES)
+        raise ValueError(f"Unsupported action rule for ablation: {name}. Allowed display names: {allowed}")
+    return canonical
+
+
+def disabled_action_ids(args) -> List[int]:
+    disabled = []
+    for name in getattr(args, "disabled_actions", []) or []:
+        canonical = canonical_action_name(name)
+        if canonical not in RULE_NAMES:
+            raise ValueError(f"Unsupported internal rule: {canonical}")
+        disabled.append(RULE_NAMES.index(canonical))
+    unique = sorted(set(disabled))
+    if len(unique) >= len(RULE_NAMES):
+        raise ValueError("At least one action rule must remain enabled.")
+    return unique
+
+
+def disabled_action_display_names(args) -> List[str]:
+    return [ACTION_DISPLAY_NAMES.get(RULE_NAMES[idx], RULE_NAMES[idx]) for idx in disabled_action_ids(args)]
 
 
 def output_paths(args, run_id: str) -> Dict[str, Path]:
@@ -272,10 +350,10 @@ def state_features(env: RollingSchedulingEnv, choices: Sequence[str], ranker_ava
     return np.asarray(base + rule_bits, dtype=np.float32)
 
 
-def select_action(model, state, device, greedy: bool = False):
+def select_action(model, state, device, greedy: bool = False, disabled_ids: Sequence[int] | None = None):
     state_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
-        dist, value = model.dist_value(state_t)
+        dist, value = model.dist_value(state_t, disabled_ids=disabled_ids)
         action = torch.argmax(dist.probs, dim=-1) if greedy else dist.sample()
     return int(action.item()), float(dist.log_prob(action).item()), float(value.item())
 
@@ -306,15 +384,16 @@ def run_episode(model, scenario: dict, args, ranker_model, device, train_mode: b
     action_sequence = []
     step_reward_sum = 0.0
     old_util = current_utilization(env)
+    disabled_ids = disabled_action_ids(args)
     while not env.is_done():
         choices = rule_choices(env, ranker_model=ranker_model, device=str(device), top_k=args.top_k)
         state = state_features(env, choices, ranker_model is not None)
-        action, logprob, value = select_action(model, state, device, greedy=not train_mode)
+        action, logprob, value = select_action(model, state, device, greedy=not train_mode, disabled_ids=disabled_ids)
         rule_name = RULE_NAMES[action]
         job_id = choices[action]
         env.step((job_id, choose_split_num(env, job_id)))
         new_util = current_utilization(env)
-        if args.reward_mode == "util_plus_cmax":
+        if args.reward_mode in {"util_only", "util_plus_cmax"}:
             step_reward = new_util - old_util
         elif args.reward_mode == "env_cmax_delta":
             step_reward = -float(env.current_cmax)
@@ -329,7 +408,12 @@ def run_episode(model, scenario: dict, args, ranker_model, device, train_mode: b
     base = baseline_cmax(scenario, args.baseline_method, ranker_model=ranker_model, device=str(device), top_k=args.top_k)
     agent_cmax = float(env.current_cmax)
     normalized_delta = (base - agent_cmax) / max(base, 1e-8)
-    final_reward = float(args.reward_beta) * normalized_delta if args.reward_mode == "util_plus_cmax" else normalized_delta
+    if args.reward_mode in {"cmax_only", "util_plus_cmax"}:
+        final_reward = float(args.reward_beta) * normalized_delta
+    elif args.reward_mode in {"env_cmax_delta", "final_delta"}:
+        final_reward = normalized_delta
+    else:
+        final_reward = 0.0
     if buffer.rewards:
         buffer.rewards[-1] += final_reward
     total_reward = step_reward_sum + final_reward
@@ -352,11 +436,12 @@ def update(model, optimizer, buffer: PPOBuffer, args, device):
     n = len(buffer)
     stats = Counter()
     updates = 0
+    disabled_ids = disabled_action_ids(args)
     for _ in range(args.update_epochs):
         order = torch.randperm(n, device=device)
         for start in range(0, n, args.mini_batch_size):
             idx = order[start : start + args.mini_batch_size]
-            dist, values = model.dist_value(batch["states"][idx])
+            dist, values = model.dist_value(batch["states"][idx], disabled_ids=disabled_ids)
             logprobs = dist.log_prob(batch["actions"][idx])
             ratio = torch.exp(logprobs - batch["old_logprobs"][idx])
             clipped = torch.clamp(ratio, 1.0 - args.clip_ratio, 1.0 + args.clip_ratio) * batch["advantages"][idx]
@@ -407,9 +492,8 @@ def evaluate_method(name: str, model, scenarios, args, ranker_model, device) -> 
 
 
 def evaluate_all(model, scenarios, args, ranker_model, device) -> List[dict]:
-    methods = ["FIFO", "MLP_Ranker_soft_ce", "HGCR-PPO"]
+    methods = ["MLP_Ranker_soft_ce", "HGCR-PPO"] if getattr(args, "no_fifo_outputs", False) else ["FIFO", "MLP_Ranker_soft_ce", "HGCR-PPO"]
     raw = {method: evaluate_method(method, model, scenarios, args, ranker_model, device) for method in methods}
-    fifo = raw["FIFO"]["Cmax_mean"]
     mlp = raw["MLP_Ranker_soft_ce"]["Cmax_mean"]
     rows = []
     for method in methods:
@@ -420,9 +504,11 @@ def evaluate_all(model, scenarios, args, ranker_model, device) -> List[dict]:
             "arrival_intensity": args.arrival_intensity,
             "carryover_ratio": args.carryover_ratio,
             **raw[method],
-            "relative_to_FIFO": (fifo - raw[method]["Cmax_mean"]) / max(fifo, 1e-8),
             "relative_to_MLPRanker": (mlp - raw[method]["Cmax_mean"]) / max(mlp, 1e-8),
         }
+        if not getattr(args, "no_fifo_outputs", False):
+            fifo = raw["FIFO"]["Cmax_mean"]
+            row["relative_to_FIFO"] = (fifo - raw[method]["Cmax_mean"]) / max(fifo, 1e-8)
         rows.append(row)
     return rows
 
@@ -536,7 +622,6 @@ def run(args) -> Path:
             if episode % max(1, args.eval_interval) == 0 or episode == args.episodes:
                 eval_rows = evaluate_all(model, eval_scenarios, args, ranker_model, device)
                 hgcr_row = next(row for row in eval_rows if row["method"] == "HGCR-PPO")
-                fifo_row = next(row for row in eval_rows if row["method"] == "FIFO")
                 mlp_row = next(row for row in eval_rows if row["method"] == "MLP-Ranker")
                 hgcr_cmax = hgcr_row["Cmax_mean"]
                 if hgcr_cmax < best_cmax:
@@ -545,24 +630,25 @@ def run(args) -> Path:
                     bad_evals = 0
                 else:
                     bad_evals += 1
-                eval_history_rows.append(
-                    {
-                        "eval_step": len(eval_history_rows) + 1,
-                        "episode": episode,
-                        "size": args.size,
-                        "seed": args.seed,
-                        "arrival_intensity": args.arrival_intensity,
-                        "carryover_ratio": args.carryover_ratio,
-                        "reward_beta": args.reward_beta,
-                        "eval_Cmax_mean": hgcr_row["Cmax_mean"],
-                        "eval_Cmax_std": hgcr_row["Cmax_std"],
-                        "eval_reward_mean": hgcr_row["reward_mean"],
-                        "eval_reward_std": hgcr_row["reward_std"],
-                        "best_so_far_Cmax": best_cmax,
-                        "baseline_FIFO_Cmax": fifo_row["Cmax_mean"],
-                        "baseline_MLPRanker_Cmax": mlp_row["Cmax_mean"],
-                    }
-                )
+                history_row = {
+                    "eval_step": len(eval_history_rows) + 1,
+                    "episode": episode,
+                    "size": args.size,
+                    "seed": args.seed,
+                    "arrival_intensity": args.arrival_intensity,
+                    "carryover_ratio": args.carryover_ratio,
+                    "reward_beta": args.reward_beta,
+                    "eval_Cmax_mean": hgcr_row["Cmax_mean"],
+                    "eval_Cmax_std": hgcr_row["Cmax_std"],
+                    "eval_reward_mean": hgcr_row["reward_mean"],
+                    "eval_reward_std": hgcr_row["reward_std"],
+                    "best_so_far_Cmax": best_cmax,
+                    "baseline_MLPRanker_Cmax": mlp_row["Cmax_mean"],
+                }
+                if not args.no_fifo_outputs:
+                    fifo_row = next(row for row in eval_rows if row["method"] == "FIFO")
+                    history_row["baseline_FIFO_Cmax"] = fifo_row["Cmax_mean"]
+                eval_history_rows.append(history_row)
             row = {"episode": episode, **ep, **stats, "is_eval_step": bool(eval_history_rows and eval_history_rows[-1]["episode"] == episode)}
             train_rows.append(row)
             curve_rows.append({key: row[key] for key in CURVE_FIELDS})
@@ -596,10 +682,10 @@ def run(args) -> Path:
         model.load_state_dict(best_state)
     eval_rows = evaluate_all(model, eval_scenarios, args, ranker_model, device)
     write_csv(train_rows, paths["train"], TRAIN_FIELDS)
-    write_csv(eval_rows, paths["eval_summary"], EVAL_FIELDS)
+    write_csv(eval_rows, paths["eval_summary"], EVAL_FIELDS_NO_FIFO if args.no_fifo_outputs else EVAL_FIELDS)
     write_csv(action_ratio_rows(action_counts), paths["action_ratio"], ACTION_FIELDS)
     write_csv(curve_rows, paths["curve"], CURVE_FIELDS)
-    write_csv(eval_history_rows, paths["eval_history"], EVAL_HISTORY_FIELDS)
+    write_csv(eval_history_rows, paths["eval_history"], EVAL_HISTORY_FIELDS_NO_FIFO if args.no_fifo_outputs else EVAL_HISTORY_FIELDS)
     write_csv(action_history_rows, paths["action_history"], ACTION_HISTORY_FIELDS)
     write_csv(action_stage_rows(action_history_rows, args), paths["action_stage"], ACTION_STAGE_FIELDS)
     torch.save({"model_state_dict": model.state_dict(), "state_dim": state_dim, "rule_names": RULE_NAMES, "run_id": run_id}, paths["checkpoint"])
@@ -622,11 +708,15 @@ def run(args) -> Path:
                 "reward_mode": args.reward_mode,
                 "reward_beta": args.reward_beta,
                 "baseline_method": args.baseline_method,
+                "ablation_family": args.ablation_family,
+                "ablation_name": args.ablation_name,
+                "disabled_actions": disabled_action_display_names(args),
+                "no_fifo_outputs": args.no_fifo_outputs,
                 "output_dir": args.output_dir,
                 "run_id": run_id,
                 "method": "HGCR-Dynamic-PPO",
                 "args": vars(args),
-                "rule_names": RULE_NAMES,
+                "rule_names": [ACTION_DISPLAY_NAMES.get(rule, rule) for rule in RULE_NAMES],
                 "state_dim": state_dim,
                 "ranker_loaded": ranker_model is not None,
                 "best_eval_Cmax_mean": best_cmax,
@@ -658,6 +748,10 @@ def main() -> None:
     parser.add_argument("--reward_mode", choices=REWARD_MODES, default="util_plus_cmax")
     parser.add_argument("--reward_beta", type=float, default=0.01)
     parser.add_argument("--baseline_method", choices=["fifo", "mlp_ranker_soft_ce"], default="fifo")
+    parser.add_argument("--ablation_family", choices=["", "reward_component", "action_library"], default="")
+    parser.add_argument("--ablation_name", default="")
+    parser.add_argument("--disabled_actions", nargs="*", default=[])
+    parser.add_argument("--no_fifo_outputs", action="store_true")
     parser.add_argument("--ranker_ckpt", default="checkpoints/stage_C/mlp_ranker/small_topk5_soft_ce/best.pt")
     parser.add_argument("--learning_rate", type=float, default=3e-5)
     parser.add_argument("--gamma", type=float, default=0.995)

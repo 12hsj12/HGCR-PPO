@@ -222,18 +222,19 @@ def load_hgcr_policy(run_dir: Path, manifest: dict, device: str):
 
 def rollout_hgcr(scenario: dict, model, ranker_model, manifest: dict, device: str):
     import torch
-    from run_hgcr_dynamic_ppo import RULE_NAMES, rule_choices, state_features
+    from run_hgcr_dynamic_ppo import disabled_action_ids, rule_choices, state_features
 
     args = SimpleNamespace(**(manifest.get("args") or {}))
     top_k = int(getattr(args, "top_k", manifest.get("top_k", 5)))
     env = reset_env_for_scenario(scenario)
+    disabled_ids = disabled_action_ids(args)
     start = time.perf_counter()
     while not env.is_done():
         choices = rule_choices(env, ranker_model=ranker_model, device=device, top_k=top_k)
         state = state_features(env, choices, ranker_model is not None)
         state_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            dist, _ = model.dist_value(state_t)
+            dist, _ = model.dist_value(state_t, disabled_ids=disabled_ids)
             action = int(torch.argmax(dist.probs, dim=-1).item())
         env.step((choices[action], choose_split_num(env, choices[action])))
     return env, time.perf_counter() - start
